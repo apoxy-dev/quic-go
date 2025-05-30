@@ -7,9 +7,10 @@ import (
 	"sync"
 
 	"github.com/quic-go/quic-go"
+	"github.com/quic-go/quic-go/internal/utils/ringbuffer"
 )
 
-const streamDatagramQueueLen = 32
+const streamDatagramQueueLen = 4096
 
 // stateTrackingStream is an implementation of quic.Stream that delegates
 // to an underlying stream
@@ -23,7 +24,7 @@ type stateTrackingStream struct {
 
 	sendDatagram func([]byte) error
 	hasData      chan struct{}
-	queue        [][]byte // TODO: use a ring buffer
+	queue        ringbuffer.RingBuffer[[]byte]
 
 	mx      sync.Mutex
 	sendErr error
@@ -48,6 +49,7 @@ func newStateTrackingStream(s quic.Stream, clearer streamClearer, sendDatagram f
 		sendDatagram: sendDatagram,
 		hasData:      make(chan struct{}, 1),
 	}
+	t.queue.Init(streamDatagramQueueLen)
 
 	context.AfterFunc(s.Context(), func() {
 		t.closeSend(context.Cause(s.Context()))
@@ -141,19 +143,18 @@ func (s *stateTrackingStream) enqueueDatagram(data []byte) {
 	if s.recvErr != nil {
 		return
 	}
-	if len(s.queue) >= streamDatagramQueueLen {
+	if s.queue.Len() >= streamDatagramQueueLen {
 		return
 	}
-	s.queue = append(s.queue, data)
+	s.queue.PushBack(data)
 	s.signalHasDatagram()
 }
 
 func (s *stateTrackingStream) ReceiveDatagram(ctx context.Context) ([]byte, error) {
 start:
 	s.mx.Lock()
-	if len(s.queue) > 0 {
-		data := s.queue[0]
-		s.queue = s.queue[1:]
+	if !s.queue.Empty() {
+		data := s.queue.PopFront()
 		s.mx.Unlock()
 		return data, nil
 	}
