@@ -15,7 +15,7 @@ const (
 )
 
 type datagramQueue struct {
-	sendMx    sync.Mutex
+	sendMx    sync.RWMutex
 	sendQueue ringbuffer.RingBuffer[*wire.DatagramFrame]
 	sent      chan struct{} // used to notify Add that a datagram was dequeued
 
@@ -45,18 +45,13 @@ func newDatagramQueue(hasData func(), logger utils.Logger) *datagramQueue {
 // Up to 32 DATAGRAM frames will be queued.
 // Once that limit is reached, Add blocks until the queue size has reduced.
 func (h *datagramQueue) Add(f *wire.DatagramFrame) error {
-	h.sendMx.Lock()
-
 	for {
+		h.sendMx.Lock()
 		if h.sendQueue.Len() < maxDatagramSendQueueLen {
 			h.sendQueue.PushBack(f)
 			h.sendMx.Unlock()
 			h.hasData()
 			return nil
-		}
-		select {
-		case <-h.sent: // drain the queue so we don't loop immediately
-		default:
 		}
 		h.sendMx.Unlock()
 		select {
@@ -64,15 +59,14 @@ func (h *datagramQueue) Add(f *wire.DatagramFrame) error {
 			return h.closeErr
 		case <-h.sent:
 		}
-		h.sendMx.Lock()
 	}
 }
 
 // Peek gets the next DATAGRAM frame for sending.
 // If actually sent out, Pop needs to be called before the next call to Peek.
 func (h *datagramQueue) Peek() *wire.DatagramFrame {
-	h.sendMx.Lock()
-	defer h.sendMx.Unlock()
+	h.sendMx.RLock()
+	defer h.sendMx.RUnlock()
 	if h.sendQueue.Empty() {
 		return nil
 	}
@@ -81,8 +75,8 @@ func (h *datagramQueue) Peek() *wire.DatagramFrame {
 
 func (h *datagramQueue) Pop() {
 	h.sendMx.Lock()
-	defer h.sendMx.Unlock()
 	_ = h.sendQueue.PopFront()
+	h.sendMx.Unlock()
 	select {
 	case h.sent <- struct{}{}:
 	default:
@@ -91,19 +85,17 @@ func (h *datagramQueue) Pop() {
 
 // HandleDatagramFrame handles a received DATAGRAM frame.
 func (h *datagramQueue) HandleDatagramFrame(f *wire.DatagramFrame) {
-	data := make([]byte, len(f.Data))
-	copy(data, f.Data)
 	var queued bool
 	h.rcvMx.Lock()
 	if len(h.rcvQueue) < maxDatagramRcvQueueLen {
-		h.rcvQueue = append(h.rcvQueue, data)
+		h.rcvQueue = append(h.rcvQueue, f.Data)
+		h.rcvMx.Unlock()
 		queued = true
 		select {
 		case h.rcvd <- struct{}{}:
 		default:
 		}
 	}
-	h.rcvMx.Unlock()
 	if !queued && h.logger.Debug() {
 		h.logger.Debugf("Discarding received DATAGRAM frame (%d bytes payload)", len(f.Data))
 	}
