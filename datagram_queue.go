@@ -5,6 +5,7 @@ import (
 	"sync"
 
 	"github.com/quic-go/quic-go/internal/utils"
+	"github.com/quic-go/quic-go/internal/utils/ringbuffer"
 	"github.com/quic-go/quic-go/internal/wire"
 )
 
@@ -14,145 +15,115 @@ const (
 )
 
 type datagramQueue struct {
-	sendMu sync.Mutex
-	rcvMu  sync.Mutex
+	sendMx    sync.RWMutex
+	sendQueue ringbuffer.RingBuffer[*wire.DatagramFrame]
+	sent      chan struct{} // used to notify Add that a datagram was dequeued
 
-	// Send queue
-	sendQueue []*wire.DatagramFrame
-	sendCond  *sync.Cond
-
-	// Receive queue
-	rcvQueue []*wire.DatagramFrame
-	rcvCond  *sync.Cond
+	rcvMx    sync.Mutex
+	rcvQueue [][]byte
+	rcvd     chan struct{} // used to notify Receive that a new datagram was received
 
 	closeErr error
-	closed   bool
+	closed   chan struct{}
 
 	hasData func()
-	logger  utils.Logger
+
+	logger utils.Logger
 }
 
 func newDatagramQueue(hasData func(), logger utils.Logger) *datagramQueue {
-	q := &datagramQueue{
+	return &datagramQueue{
 		hasData: hasData,
+		rcvd:    make(chan struct{}, 1),
+		sent:    make(chan struct{}, 1),
+		closed:  make(chan struct{}),
 		logger:  logger,
 	}
-	q.sendCond = sync.NewCond(&q.sendMu)
-	q.rcvCond = sync.NewCond(&q.rcvMu)
-	return q
 }
 
 // Add queues a new DATAGRAM frame for sending.
-// Blocks until there's space in the queue.
+// Up to 32 DATAGRAM frames will be queued.
+// Once that limit is reached, Add blocks until the queue size has reduced.
 func (h *datagramQueue) Add(f *wire.DatagramFrame) error {
-	h.sendMu.Lock()
-	defer h.sendMu.Unlock()
-
-	for len(h.sendQueue) >= maxDatagramSendQueueLen && !h.closed {
-		h.sendCond.Wait()
+	for {
+		h.sendMx.Lock()
+		if h.sendQueue.Len() < maxDatagramSendQueueLen {
+			h.sendQueue.PushBack(f)
+			h.sendMx.Unlock()
+			h.hasData()
+			return nil
+		}
+		h.sendMx.Unlock()
+		select {
+		case <-h.closed:
+			return h.closeErr
+		case <-h.sent:
+		}
 	}
-
-	if h.closed {
-		return h.closeErr
-	}
-
-	h.sendQueue = append(h.sendQueue, f)
-	h.hasData()
-	return nil
 }
 
 // Peek gets the next DATAGRAM frame for sending.
 // If actually sent out, Pop needs to be called before the next call to Peek.
 func (h *datagramQueue) Peek() *wire.DatagramFrame {
-	h.sendMu.Lock()
-	defer h.sendMu.Unlock()
-
-	if len(h.sendQueue) == 0 {
+	h.sendMx.RLock()
+	defer h.sendMx.RUnlock()
+	if h.sendQueue.Empty() {
 		return nil
 	}
-
-	return h.sendQueue[0]
+	return h.sendQueue.PeekFront()
 }
 
 func (h *datagramQueue) Pop() {
-	h.sendMu.Lock()
-	defer h.sendMu.Unlock()
-
-	if len(h.sendQueue) > 0 {
-		h.sendQueue = h.sendQueue[1:]
-		h.sendCond.Signal()
+	h.sendMx.Lock()
+	_ = h.sendQueue.PopFront()
+	h.sendMx.Unlock()
+	select {
+	case h.sent <- struct{}{}:
+	default:
 	}
 }
 
 // HandleDatagramFrame handles a received DATAGRAM frame.
 func (h *datagramQueue) HandleDatagramFrame(f *wire.DatagramFrame) {
-	h.rcvMu.Lock()
-	defer h.rcvMu.Unlock()
-
-	if len(h.rcvQueue) >= maxDatagramRcvQueueLen {
-		if h.logger.Debug() {
-			h.logger.Debugf("Discarding received DATAGRAM frame (%d bytes payload)", len(f.Data))
+	var queued bool
+	h.rcvMx.Lock()
+	if len(h.rcvQueue) < maxDatagramRcvQueueLen {
+		h.rcvQueue = append(h.rcvQueue, f.Data)
+		h.rcvMx.Unlock()
+		queued = true
+		select {
+		case h.rcvd <- struct{}{}:
+		default:
 		}
-		return
 	}
-
-	h.rcvQueue = append(h.rcvQueue, f)
-	h.rcvCond.Signal()
+	if !queued && h.logger.Debug() {
+		h.logger.Debugf("Discarding received DATAGRAM frame (%d bytes payload)", len(f.Data))
+	}
 }
 
 // Receive gets a received DATAGRAM frame.
 func (h *datagramQueue) Receive(ctx context.Context) ([]byte, error) {
-	h.rcvMu.Lock()
-	defer h.rcvMu.Unlock()
-
-	// Check for immediate return conditions
 	for {
-		if h.closed {
-			return nil, h.closeErr
-		}
-
+		h.rcvMx.Lock()
 		if len(h.rcvQueue) > 0 {
-			frame := h.rcvQueue[0]
+			data := h.rcvQueue[0]
 			h.rcvQueue = h.rcvQueue[1:]
-			return frame.Data, nil
+			h.rcvMx.Unlock()
+			return data, nil
 		}
-
-		// Check context cancellation
+		h.rcvMx.Unlock()
 		select {
+		case <-h.rcvd:
+			continue
+		case <-h.closed:
+			return nil, h.closeErr
 		case <-ctx.Done():
 			return nil, ctx.Err()
-		default:
 		}
-
-		// Need to wait - use goroutine to handle context cancellation
-		done := make(chan struct{})
-		go func() {
-			select {
-			case <-ctx.Done():
-				h.rcvMu.Lock()
-				h.rcvCond.Broadcast()
-				h.rcvMu.Unlock()
-			case <-done:
-			}
-		}()
-
-		h.rcvCond.Wait()
-		close(done)
 	}
 }
 
 func (h *datagramQueue) CloseWithError(e error) {
-	h.sendMu.Lock()
-	h.rcvMu.Lock()
-	defer h.sendMu.Unlock()
-	defer h.rcvMu.Unlock()
-
-	if h.closed {
-		return
-	}
-
 	h.closeErr = e
-	h.closed = true
-	h.sendCond.Broadcast()
-	h.rcvCond.Broadcast()
+	close(h.closed)
 }
