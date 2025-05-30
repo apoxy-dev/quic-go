@@ -13,6 +13,7 @@ import (
 
 	"github.com/quic-go/quic-go"
 	"github.com/quic-go/quic-go/http3/qlog"
+	"github.com/quic-go/quic-go/internal/wire"
 	"github.com/quic-go/quic-go/qlogwriter"
 	"github.com/quic-go/quic-go/quicvarint"
 )
@@ -21,6 +22,12 @@ const maxQuarterStreamID = 1<<60 - 1
 
 // invalidStreamID is a stream ID that is invalid. The first valid stream ID in QUIC is 0.
 const invalidStreamID = quic.StreamID(-1)
+
+var datagramBufferPool = sync.Pool{
+	New: func() any {
+		return make([]byte, 0, wire.MaxDatagramSize)
+	},
+}
 
 // rawConn is an HTTP/3 connection.
 // It provides HTTP/3 specific functionality by wrapping a quic.Conn,
@@ -250,8 +257,8 @@ func (c *rawConn) handleControlStream(str *quic.ReceiveStream) {
 }
 
 func (c *rawConn) sendDatagram(streamID quic.StreamID, b []byte) error {
-	// TODO: this creates a lot of garbage and an additional copy
-	data := make([]byte, 0, len(b)+8)
+	data := datagramBufferPool.Get().([]byte)
+	defer datagramBufferPool.Put(data[:0])
 	quarterStreamID := uint64(streamID / 4)
 	data = quicvarint.Append(data, uint64(streamID/4))
 	data = append(data, b...)
