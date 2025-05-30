@@ -15,6 +15,7 @@ import (
 
 	"github.com/quic-go/quic-go"
 	"github.com/quic-go/quic-go/internal/protocol"
+	"github.com/quic-go/quic-go/internal/wire"
 	"github.com/quic-go/quic-go/quicvarint"
 
 	"github.com/quic-go/qpack"
@@ -23,6 +24,12 @@ import (
 const maxQuarterStreamID = 1<<60 - 1
 
 var errGoAway = errors.New("connection in graceful shutdown")
+
+var datagramBufferPool = sync.Pool{
+	New: func() interface{} {
+		return make([]byte, 0, wire.MaxDatagramSize)
+	},
+}
 
 // Connection is an HTTP/3 connection.
 // It has all methods from the quic.Connection expect for AcceptStream, AcceptUniStream,
@@ -375,8 +382,9 @@ func (c *connection) handleControlStream(str quic.ReceiveStream) {
 }
 
 func (c *connection) sendDatagram(streamID protocol.StreamID, b []byte) error {
-	// TODO: this creates a lot of garbage and an additional copy
-	data := make([]byte, 0, len(b)+8)
+	data := datagramBufferPool.Get().([]byte)
+	defer datagramBufferPool.Put(data[:0])
+
 	data = quicvarint.Append(data, uint64(streamID/4))
 	data = append(data, b...)
 	return c.SendDatagram(data)
