@@ -116,6 +116,7 @@ func testSentPacketHandlerSendAndAcknowledge(t *testing.T, encLevel protocol.Enc
 		false,
 		false,
 		nil,
+		false, // disable congestion control
 		protocol.PerspectiveClient,
 		nil,
 		utils.DefaultLogger,
@@ -171,6 +172,7 @@ func TestSentPacketHandlerAcknowledgeSkippedPacket(t *testing.T) {
 		false,
 		false,
 		nil,
+		false, // disable congestion control
 		protocol.PerspectiveClient,
 		nil,
 		utils.DefaultLogger,
@@ -214,6 +216,7 @@ func TestSentPacketHandlerRTTAckEliciting(t *testing.T) {
 		false,
 		false,
 		nil,
+		false, // disable congestion control
 		protocol.PerspectiveClient,
 		&eventRecorder,
 		utils.DefaultLogger,
@@ -302,6 +305,7 @@ func TestSentPacketHandlerRTTAcrossPacketNumberSpaces(t *testing.T) {
 		false,
 		false,
 		nil,
+		false, // disable congestion control
 		protocol.PerspectiveClient,
 		nil,
 		utils.DefaultLogger,
@@ -363,6 +367,7 @@ func testSentPacketHandlerRTTAckDelays(t *testing.T, encLevel protocol.Encryptio
 		false,
 		false,
 		nil,
+		false, // disable congestion control
 		protocol.PerspectiveClient,
 		nil,
 		utils.DefaultLogger,
@@ -454,6 +459,7 @@ func testSentPacketHandlerAmplificationLimitServer(t *testing.T, addressValidate
 		addressValidated,
 		false,
 		nil,
+		false, // disable congestion control
 		protocol.PerspectiveServer,
 		nil,
 		utils.DefaultLogger,
@@ -525,6 +531,7 @@ func testSentPacketHandlerAmplificationLimitClient(t *testing.T, dropHandshake b
 		true,
 		false,
 		nil,
+		false, // disable congestion control
 		protocol.PerspectiveClient,
 		nil,
 		utils.DefaultLogger,
@@ -581,6 +588,7 @@ func TestSentPacketHandlerDelayBasedLossDetection(t *testing.T) {
 		true,
 		false,
 		nil,
+		false, // disable congestion control
 		protocol.PerspectiveServer,
 		nil,
 		utils.DefaultLogger,
@@ -636,6 +644,7 @@ func TestSentPacketHandlerPacketBasedLossDetection(t *testing.T) {
 		true,
 		false,
 		nil,
+		false, // disable congestion control
 		protocol.PerspectiveServer,
 		nil,
 		utils.DefaultLogger,
@@ -698,6 +707,7 @@ func testSentPacketHandlerPTO(t *testing.T, encLevel protocol.EncryptionLevel, p
 		true,
 		false,
 		nil,
+		false, // disable congestion control
 		protocol.PerspectiveServer,
 		&eventRecorder,
 		utils.DefaultLogger,
@@ -916,6 +926,7 @@ func TestSentPacketHandlerPacketNumberSpacesPTO(t *testing.T) {
 		true,
 		false,
 		nil,
+		false, // disable congestion control
 		protocol.PerspectiveServer,
 		nil,
 		utils.DefaultLogger,
@@ -1009,6 +1020,7 @@ func TestSentPacketHandler0RTT(t *testing.T) {
 		true,
 		false,
 		nil,
+		false, // disable congestion control
 		protocol.PerspectiveClient,
 		nil,
 		utils.DefaultLogger,
@@ -1061,6 +1073,7 @@ func TestSentPacketHandlerCongestion(t *testing.T) {
 		true,
 		false,
 		nil,
+		false, // disable congestion control
 		protocol.PerspectiveServer,
 		nil,
 		utils.DefaultLogger,
@@ -1162,6 +1175,7 @@ func testSentPacketHandlerRetry(t *testing.T, rtt, expectedRTT time.Duration) {
 		true,
 		false,
 		nil,
+		false, // disable congestion control
 		protocol.PerspectiveClient,
 		nil,
 		utils.DefaultLogger,
@@ -1214,6 +1228,7 @@ func TestSentPacketHandlerRetryAfterPTO(t *testing.T) {
 		true,
 		false,
 		nil,
+		false, // disable congestion control
 		protocol.PerspectiveClient,
 		nil,
 		utils.DefaultLogger,
@@ -1259,6 +1274,7 @@ func TestSentPacketHandlerECN(t *testing.T) {
 		true,
 		false,
 		nil,
+		false, // disable congestion control
 		protocol.PerspectiveClient,
 		nil,
 		utils.DefaultLogger,
@@ -1364,6 +1380,7 @@ func TestSentPacketHandlerPathProbe(t *testing.T) {
 		true,
 		false,
 		nil,
+		false, // disable congestion control
 		protocol.PerspectiveClient,
 		nil,
 		utils.DefaultLogger,
@@ -1445,6 +1462,7 @@ func TestSentPacketHandlerPathProbeAckAndLoss(t *testing.T) {
 		true,
 		false,
 		nil,
+		false, // disable congestion control
 		protocol.PerspectiveClient,
 		nil,
 		utils.DefaultLogger,
@@ -1522,6 +1540,7 @@ func testSentPacketHandlerRandomized(t *testing.T, seed uint64) {
 		true,
 		false,
 		nil,
+		false, // disable congestion control
 		protocol.PerspectiveClient,
 		nil,
 		utils.DefaultLogger,
@@ -1592,6 +1611,7 @@ func TestSentPacketHandlerSpuriousLoss(t *testing.T) {
 		true,
 		false,
 		nil,
+		false, // disable congestion control
 		protocol.PerspectiveClient,
 		&eventRecorder,
 		utils.DefaultLogger,
@@ -1728,6 +1748,7 @@ func benchmarkSendAndAcknowledge(b *testing.B, ackEvery, inFlight int) {
 		true,
 		false,
 		nil,
+		false, // disable congestion control
 		protocol.PerspectiveClient,
 		nil,
 		utils.DefaultLogger,

@@ -175,6 +175,11 @@ type Config struct {
 	// Enable QUIC Stream Resets with Partial Delivery.
 	// See https://datatracker.ietf.org/doc/html/draft-ietf-quic-reliable-stream-reset-07.
 	EnableStreamResetPartialDelivery bool
+	// DisableCongestionControl replaces the default Cubic congestion controller
+	// with a no-op that always allows sending. Use this when an inner transport
+	// (e.g. netstack TCP) already handles congestion control and QUIC CC would
+	// be redundant.
+	DisableCongestionControl bool
 
 	Tracer func(ctx context.Context, isClient bool, connID ConnectionID) qlogwriter.Trace
 }
