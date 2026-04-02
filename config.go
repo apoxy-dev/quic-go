@@ -120,6 +120,7 @@ func populateConfig(config *Config) *Config {
 		MaxIncomingUniStreams:          maxIncomingUniStreams,
 		TokenStore:                     config.TokenStore,
 		EnableDatagrams:                config.EnableDatagrams,
+		DisableCongestionControl:       config.DisableCongestionControl,
 		InitialPacketSize:              initialPacketSize,
 		DisablePathMTUDiscovery:        config.DisablePathMTUDiscovery,
 		Allow0RTT:                      config.Allow0RTT,

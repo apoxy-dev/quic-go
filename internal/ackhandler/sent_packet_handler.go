@@ -88,8 +88,9 @@ type sentPacketHandler struct {
 
 	bytesInFlight protocol.ByteCount
 
-	congestion congestion.SendAlgorithmWithDebugInfos
-	rttStats   *utils.RTTStats
+	congestion               congestion.SendAlgorithmWithDebugInfos
+	disableCongestionControl bool
+	rttStats                 *utils.RTTStats
 
 	// The number of times a PTO has been sent without receiving an ack.
 	ptoCount uint32
@@ -123,17 +124,23 @@ func newSentPacketHandler(
 	rttStats *utils.RTTStats,
 	clientAddressValidated bool,
 	enableECN bool,
+	disableCongestionControl bool,
 	pers protocol.Perspective,
 	tracer *logging.ConnectionTracer,
 	logger utils.Logger,
 ) *sentPacketHandler {
-	congestion := congestion.NewCubicSender(
-		congestion.DefaultClock{},
-		rttStats,
-		initialMaxDatagramSize,
-		true, // use Reno
-		tracer,
-	)
+	var cc congestion.SendAlgorithmWithDebugInfos
+	if disableCongestionControl {
+		cc = congestion.NewNoopSender()
+	} else {
+		cc = congestion.NewCubicSender(
+			congestion.DefaultClock{},
+			rttStats,
+			initialMaxDatagramSize,
+			true, // use Reno
+			tracer,
+		)
+	}
 
 	h := &sentPacketHandler{
 		peerCompletedAddressValidation: pers == protocol.PerspectiveServer,
@@ -142,7 +149,8 @@ func newSentPacketHandler(
 		handshakePackets:               newPacketNumberSpace(0, false),
 		appDataPackets:                 newPacketNumberSpace(0, true),
 		rttStats:                       rttStats,
-		congestion:                     congestion,
+		congestion:                     cc,
+		disableCongestionControl:       disableCongestionControl,
 		perspective:                    pers,
 		tracer:                         tracer,
 		logger:                         logger,
@@ -989,12 +997,16 @@ func (h *sentPacketHandler) MigratedPath(now time.Time, initialMaxDatagramSize p
 	for p := range h.appDataPackets.history.PathProbes() {
 		h.appDataPackets.history.RemovePathProbe(p.PacketNumber)
 	}
-	h.congestion = congestion.NewCubicSender(
-		congestion.DefaultClock{},
-		h.rttStats,
-		initialMaxDatagramSize,
-		true, // use Reno
-		h.tracer,
-	)
+	if h.disableCongestionControl {
+		h.congestion = congestion.NewNoopSender()
+	} else {
+		h.congestion = congestion.NewCubicSender(
+			congestion.DefaultClock{},
+			h.rttStats,
+			initialMaxDatagramSize,
+			true, // use Reno
+			h.tracer,
+		)
+	}
 	h.setLossDetectionTimer(now)
 }

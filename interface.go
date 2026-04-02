@@ -327,6 +327,11 @@ type Config struct {
 	Allow0RTT bool
 	// Enable QUIC datagram support (RFC 9221).
 	EnableDatagrams bool
+	// DisableCongestionControl replaces the default Cubic congestion controller
+	// with a no-op that always allows sending. Use this when an inner transport
+	// (e.g. netstack TCP) already handles congestion control and QUIC CC would
+	// be redundant.
+	DisableCongestionControl bool
 	Tracer          func(context.Context, logging.Perspective, ConnectionID) *logging.ConnectionTracer
 }
 

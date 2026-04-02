@@ -287,6 +287,7 @@ var newConnection = func(
 		s.rttStats,
 		clientAddressValidated,
 		s.conn.capabilities().ECN,
+		s.config.DisableCongestionControl,
 		s.perspective,
 		s.tracer,
 		s.logger,
@@ -400,6 +401,7 @@ var newClientConnection = func(
 		s.rttStats,
 		false, // has no effect
 		s.conn.capabilities().ECN,
+		s.config.DisableCongestionControl,
 		s.perspective,
 		s.tracer,
 		s.logger,
