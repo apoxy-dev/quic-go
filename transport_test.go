@@ -414,6 +414,28 @@ func TestTransportNonQUICPackets(t *testing.T) {
 	require.Equal(t, received, maxQueuedNonQUICPackets)
 }
 
+func TestTransportStartNonQUICPacketHandler(t *testing.T) {
+	got := make(chan []byte, 1)
+	tr := &Transport{
+		Conn: newUDPConnLocalhost(t),
+		NonQUICPacketHandler: func(b []byte, _ net.Addr) {
+			got <- append([]byte(nil), b...)
+		},
+	}
+	defer tr.Close()
+	require.NoError(t, tr.Start())
+
+	conn := newUDPConnLocalhost(t)
+	_, err := conn.WriteTo([]byte{0 /* don't set the QUIC bit */, 42}, tr.Conn.LocalAddr())
+	require.NoError(t, err)
+	select {
+	case b := <-got:
+		require.Equal(t, []byte{0, 42}, b)
+	case <-time.After(time.Second):
+		t.Fatal("handler got no packet")
+	}
+}
+
 // Concurrent first calls to ReadNonQUICPacket must share one queue.
 func TestTransportNonQUICPacketsConcurrentFirstRead(t *testing.T) {
 	// The race is rare, so repeat.

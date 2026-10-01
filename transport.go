@@ -441,6 +441,12 @@ func (t *Transport) init(allowZeroLengthConnIDs bool) error {
 	return t.initErr
 }
 
+// Start starts the read loop on Conn. Listen, Dial and WriteTo also start it.
+// Call it when only NonQUICPacketHandler receives on the Transport.
+func (t *Transport) Start() error {
+	return t.init(false)
+}
+
 // WriteTo sends a packet on the underlying connection.
 func (t *Transport) WriteTo(b []byte, addr net.Addr) (int, error) {
 	if err := t.init(false); err != nil {
