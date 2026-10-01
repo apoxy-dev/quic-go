@@ -414,6 +414,44 @@ func TestTransportNonQUICPackets(t *testing.T) {
 	require.Equal(t, received, maxQueuedNonQUICPackets)
 }
 
+// Concurrent first calls to ReadNonQUICPacket must share one queue.
+func TestTransportNonQUICPacketsConcurrentFirstRead(t *testing.T) {
+	// The race is rare, so repeat.
+	for range 20 {
+		testTransportNonQUICPacketsConcurrentFirstRead(t)
+	}
+}
+
+func testTransportNonQUICPacketsConcurrentFirstRead(t *testing.T) {
+	tr := &Transport{Conn: newUDPConnLocalhost(t)}
+	defer tr.Close()
+
+	const readers = 16
+	start := make(chan struct{})
+	errChan := make(chan error, readers)
+	for range readers {
+		go func() {
+			<-start
+			ctx, cancel := context.WithTimeout(context.Background(), scaleDuration(time.Second))
+			defer cancel()
+			_, _, err := tr.ReadNonQUICPacket(ctx, make([]byte, 1024))
+			errChan <- err
+		}()
+	}
+	close(start)
+	// Packets that arrive before the first ReadNonQUICPacket call are dropped.
+	require.Eventually(t, tr.readingNonQUICPackets.Load, time.Second, time.Millisecond)
+
+	conn := newUDPConnLocalhost(t)
+	for i := range readers {
+		_, err := conn.WriteTo([]byte{0 /* don't set the QUIC bit */, uint8(i)}, tr.Conn.LocalAddr())
+		require.NoError(t, err)
+	}
+	for range readers {
+		require.NoError(t, <-errChan)
+	}
+}
+
 type faultySyscallConn struct{ net.PacketConn }
 
 func (c *faultySyscallConn) SyscallConn() (syscall.RawConn, error) { return nil, assert.AnError }
@@ -632,6 +670,35 @@ func TestTransportReplaceWithClosed(t *testing.T) {
 	t.Run("remote", func(t *testing.T) {
 		testTransportReplaceWithClosed(t, false)
 	})
+}
+
+// The ReplaceWithClosed timer must take the Transport mutex before connMx, as doDial does.
+func TestTransportReplaceWithClosedLockOrder(t *testing.T) {
+	tr := &Transport{Conn: newUDPConnLocalhost(t), ConnectionIDLength: 4}
+	require.NoError(t, tr.init(true))
+	defer tr.Close()
+
+	connID := protocol.ParseConnectionID([]byte{4, 3, 2, 1})
+	m := (*packetHandlerMap)(tr)
+	require.True(t, m.Add(connID, &mockPacketHandler{}))
+
+	// Hold the Transport mutex while the timer fires; connMx must stay free.
+	tr.mutex.Lock()
+	m.ReplaceWithClosed([]protocol.ConnectionID{connID}, nil, time.Millisecond)
+	ok := assert.Never(t, func() bool {
+		if !tr.connMx.TryLock() {
+			return true
+		}
+		tr.connMx.Unlock()
+		return false
+	}, scaleDuration(100*time.Millisecond), time.Millisecond, "the timer holds connMx while it waits for the Transport mutex")
+	tr.mutex.Unlock()
+	require.True(t, ok)
+
+	require.Eventually(t, func() bool {
+		_, ok := m.Get(connID)
+		return !ok
+	}, time.Second, time.Millisecond)
 }
 
 func testTransportReplaceWithClosed(t *testing.T, local bool) {

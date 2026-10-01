@@ -4,12 +4,14 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
 	mrand "math/rand/v2"
 	"net"
 	"runtime"
+	"sync"
 	"testing"
 	"time"
 
@@ -344,4 +346,107 @@ func TestMultiplexingNonQUICPackets(t *testing.T) {
 			t.Fatalf("didn't receive enough non-QUIC packets: %d < %d", counter, minExpected)
 		}
 	}
+}
+
+// NonQUICPacketHandler gets every packet of a burst, and QUIC on the same Transport still works.
+func TestMultiplexingNonQUICPacketHandler(t *testing.T) {
+	const numPackets = 10000
+	const packetLen = 128
+	// 8x the ReadNonQUICPacket queue. Wait after each burst so the kernel buffer does not drop.
+	const burst = 256
+
+	tr1 := &quic.Transport{Conn: newUDPConnLocalhost(t)}
+	defer tr1.Close()
+	addTracer(tr1)
+	server, err := tr1.Listen(getTLSConfig(), getQuicConfig(nil))
+	require.NoError(t, err)
+	defer server.Close()
+
+	var mx sync.Mutex
+	seen := make([]bool, numPackets)
+	var received int
+	var handlerErr error
+	receivedAll := func(n int) func() bool {
+		return func() bool {
+			mx.Lock()
+			defer mx.Unlock()
+			return handlerErr != nil || received == n
+		}
+	}
+	tr2 := &quic.Transport{
+		Conn: newUDPConnLocalhost(t),
+		NonQUICPacketHandler: func(b []byte, addr net.Addr) {
+			mx.Lock()
+			defer mx.Unlock()
+			if handlerErr != nil {
+				return
+			}
+			if len(b) != packetLen || addr.String() != tr1.Conn.LocalAddr().String() {
+				handlerErr = fmt.Errorf("unexpected packet: %d bytes from %s", len(b), addr)
+				return
+			}
+			i := binary.BigEndian.Uint32(b[1:])
+			if i >= numPackets || seen[i] || !bytes.Equal(b[5:], bytes.Repeat([]byte{byte(i)}, packetLen-5)) {
+				handlerErr = fmt.Errorf("unexpected or duplicate packet %d", i)
+				return
+			}
+			seen[i] = true
+			received++
+		},
+	}
+	defer tr2.Close()
+	addTracer(tr2)
+
+	ctx, cancel := context.WithTimeout(context.Background(), scaleDuration(5*time.Second))
+	defer cancel()
+	conn, err := tr2.Dial(ctx, server.Addr(), getTLSClientConfig(), getQuicConfig(nil))
+	require.NoError(t, err)
+	defer conn.CloseWithError(0, "")
+	serverConn, err := server.Accept(ctx)
+	require.NoError(t, err)
+
+	// The server echoes the stream data back to the client.
+	go func() {
+		str, err := serverConn.AcceptStream(context.Background())
+		if err != nil {
+			return
+		}
+		io.Copy(str, str)
+		str.Close()
+	}()
+	str, err := conn.OpenStreamSync(ctx)
+	require.NoError(t, err)
+	require.NoError(t, str.SetDeadline(time.Now().Add(scaleDuration(10*time.Second))))
+	echo := func(i int) {
+		msg := make([]byte, 1024)
+		rand.Read(msg)
+		_, err := str.Write(msg)
+		require.NoError(t, err)
+		rcvd := make([]byte, len(msg))
+		_, err = io.ReadFull(str, rcvd)
+		require.NoError(t, err, "echo after %d packets", i)
+		require.Equal(t, msg, rcvd)
+	}
+
+	for i := range numPackets {
+		b := make([]byte, packetLen) // keep the first byte set to 0, so it's not classified as a QUIC packet
+		binary.BigEndian.PutUint32(b[1:], uint32(i))
+		copy(b[5:], bytes.Repeat([]byte{byte(i)}, packetLen-5))
+		_, err := tr1.WriteTo(b, tr2.Conn.LocalAddr())
+		// The first sendmsg call on a new UDP socket sometimes errors on Linux.
+		// See https://github.com/golang/go/issues/63322.
+		if err != nil && i == 0 && runtime.GOOS == "linux" && isPermissionError(err) {
+			_, err = tr1.WriteTo(b, tr2.Conn.LocalAddr())
+		}
+		require.NoError(t, err)
+		if (i+1)%burst == 0 || i+1 == numPackets {
+			require.Eventually(t, receivedAll(i+1), scaleDuration(5*time.Second), scaleDuration(time.Millisecond))
+			echo(i + 1)
+		}
+	}
+
+	mx.Lock()
+	defer mx.Unlock()
+	require.NoError(t, handlerErr)
+	require.Equal(t, numPackets, received)
 }
