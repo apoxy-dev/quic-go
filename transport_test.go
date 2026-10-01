@@ -431,6 +431,44 @@ func TestTransportNonQUICPackets(t *testing.T) {
 	})
 }
 
+// Concurrent first calls to ReadNonQUICPacket must share one queue.
+func TestTransportNonQUICPacketsConcurrentFirstRead(t *testing.T) {
+	// The race is rare, so repeat.
+	for range 20 {
+		testTransportNonQUICPacketsConcurrentFirstRead(t)
+	}
+}
+
+func testTransportNonQUICPacketsConcurrentFirstRead(t *testing.T) {
+	tr := &Transport{Conn: newUDPConnLocalhost(t)}
+	defer tr.Close()
+
+	const readers = 16
+	start := make(chan struct{})
+	errChan := make(chan error, readers)
+	for range readers {
+		go func() {
+			<-start
+			ctx, cancel := context.WithTimeout(context.Background(), scaleDuration(time.Second))
+			defer cancel()
+			_, _, err := tr.ReadNonQUICPacket(ctx, make([]byte, 1024))
+			errChan <- err
+		}()
+	}
+	close(start)
+	// Packets that arrive before the first ReadNonQUICPacket call are dropped.
+	require.Eventually(t, tr.readingNonQUICPackets.Load, time.Second, time.Millisecond)
+
+	conn := newUDPConnLocalhost(t)
+	for i := range readers {
+		_, err := conn.WriteTo([]byte{0 /* don't set the QUIC bit */, uint8(i)}, tr.Conn.LocalAddr())
+		require.NoError(t, err)
+	}
+	for range readers {
+		require.NoError(t, <-errChan)
+	}
+}
+
 type faultySyscallConn struct{ net.PacketConn }
 
 func (c *faultySyscallConn) SyscallConn() (syscall.RawConn, error) { return nil, assert.AnError }

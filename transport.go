@@ -134,6 +134,10 @@ type Transport struct {
 	// Recorder.Close is called when the transport is closed.
 	Tracer qlogwriter.Recorder
 
+	// NonQUICPacketHandler, if set, receives non-QUIC packets in place of ReadNonQUICPacket.
+	// It runs on the read loop and must not block; b is valid only until it returns.
+	NonQUICPacketHandler func(b []byte, addr net.Addr)
+
 	mutex       sync.Mutex
 	handlers    map[protocol.ConnectionID]packetHandler
 	resetTokens map[protocol.StatelessResetToken]packetHandler
@@ -160,6 +164,7 @@ type Transport struct {
 	createdConn bool
 	isSingleUse bool // was created for a single server or client, i.e. by calling quic.Listen or quic.Dial
 
+	nonQUICOnce           sync.Once
 	readingNonQUICPackets atomic.Bool
 	nonQUICPackets        chan receivedPacket
 
@@ -691,6 +696,11 @@ func (t *Transport) maybeHandleStatelessReset(data []byte) bool {
 }
 
 func (t *Transport) handleNonQUICPacket(p receivedPacket) {
+	if t.NonQUICPacketHandler != nil {
+		t.NonQUICPacketHandler(p.data, p.remoteAddr)
+		p.buffer.Release()
+		return
+	}
 	// Strictly speaking, this is racy,
 	// but we only care about receiving packets at some point after ReadNonQUICPacket has been called.
 	if !t.readingNonQUICPackets.Load() {
@@ -713,14 +723,15 @@ const maxQueuedNonQUICPackets = 32
 // ReadNonQUICPacket reads non-QUIC packets received on the underlying connection.
 // The detection logic is very simple: Any packet that has the first and second bit of the packet set to 0.
 // Note that this is stricter than the detection logic defined in RFC 9443.
+// If NonQUICPacketHandler is set, ReadNonQUICPacket receives no packets.
 func (t *Transport) ReadNonQUICPacket(ctx context.Context, b []byte) (int, net.Addr, error) {
 	if err := t.init(false); err != nil {
 		return 0, nil, err
 	}
-	if !t.readingNonQUICPackets.Load() {
+	t.nonQUICOnce.Do(func() {
 		t.nonQUICPackets = make(chan receivedPacket, maxQueuedNonQUICPackets)
 		t.readingNonQUICPackets.Store(true)
-	}
+	})
 	select {
 	case <-ctx.Done():
 		return 0, nil, ctx.Err()
