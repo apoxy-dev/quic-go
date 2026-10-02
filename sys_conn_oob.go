@@ -159,6 +159,9 @@ func newConn(c OOBCapablePacketConn, supportsDF bool) (*oobConn, error) {
 
 var invalidCmsgOnceV4, invalidCmsgOnceV6 sync.Once
 
+// buffered reports if packets of the last batch are left to read.
+func (c *oobConn) buffered() bool { return int(c.readPos) < len(c.messages) }
+
 func (c *oobConn) ReadPacket() (receivedPacket, error) {
 	if len(c.messages) == int(c.readPos) { // all messages read. Read the next batch of messages.
 		c.messages = c.messages[:batchSize]
