@@ -39,4 +39,11 @@ func isSendMsgSizeErr(err error) bool {
 	return errors.Is(err, unix.EMSGSIZE)
 }
 
+// isNoRouteErr reports whether a send failed because the host has no route or
+// no source address for the peer.
+func isNoRouteErr(err error) bool {
+	return errors.Is(err, unix.ENETUNREACH) || errors.Is(err, unix.EHOSTUNREACH) ||
+		errors.Is(err, unix.ENETDOWN) || errors.Is(err, unix.EADDRNOTAVAIL)
+}
+
 func isRecvMsgSizeErr(error) bool { return false }
