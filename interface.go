@@ -178,6 +178,8 @@ type Config struct {
 	// DisableCongestionControl replaces the Cubic congestion controller with one that always allows sending.
 	// Use it when an inner transport, for example TCP in a netstack, already controls congestion.
 	DisableCongestionControl bool
+	// DisableECN sends all packets as Not-ECT, and the connection does not run ECN validation.
+	DisableECN bool
 
 	Tracer func(ctx context.Context, isClient bool, connID ConnectionID) qlogwriter.Trace
 }

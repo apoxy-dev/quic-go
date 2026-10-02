@@ -318,7 +318,7 @@ var newConnection = func(
 		s.rttStats,
 		&s.connStats,
 		clientAddressValidated,
-		s.conn.capabilities().ECN,
+		s.conn.capabilities().ECN && !s.config.DisableECN,
 		s.receivedPacketHandler.IgnorePacketsBelow,
 		s.config.DisableCongestionControl,
 		s.perspective,
@@ -448,7 +448,7 @@ var newClientConnection = func(
 		s.rttStats,
 		&s.connStats,
 		false, // has no effect
-		s.conn.capabilities().ECN,
+		s.conn.capabilities().ECN && !s.config.DisableECN,
 		s.receivedPacketHandler.IgnorePacketsBelow,
 		s.config.DisableCongestionControl,
 		s.perspective,
