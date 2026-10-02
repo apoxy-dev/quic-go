@@ -3,6 +3,7 @@ package self_test
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
 	"fmt"
 	"io"
 	mrand "math/rand/v2"
@@ -307,6 +308,69 @@ func testDatagramSizes(t *testing.T, sender, receiver quic.Connection, ips int) 
 		require.Equal(t, data, got)
 	}
 	require.NotZero(t, accepted)
+}
+
+// The sender writes all datagrams from one buffer, and quic-go reuses its send buffers.
+// Each datagram that arrives must have the payload that was sent, and arrive only once.
+func TestDatagramPayloadsWithBufferReuse(t *testing.T) {
+	server, err := quic.Listen(
+		newUDPConnLocalhost(t),
+		getTLSConfig(),
+		getQuicConfig(&quic.Config{EnableDatagrams: true}),
+	)
+	require.NoError(t, err)
+	defer server.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), scaleDuration(2*time.Second))
+	defer cancel()
+	clientConn, err := quic.Dial(
+		ctx,
+		newUDPConnLocalhost(t),
+		server.Addr(),
+		getTLSClientConfig(),
+		getQuicConfig(&quic.Config{EnableDatagrams: true}),
+	)
+	require.NoError(t, err)
+	defer clientConn.CloseWithError(0, "")
+	serverConn, err := server.Accept(ctx)
+	require.NoError(t, err)
+	defer serverConn.CloseWithError(0, "")
+
+	// The sizes use both buffer pools.
+	const num = 2000
+	sizes := []int{100, 1000}
+	payload := func(b []byte, i int) []byte {
+		b = b[:sizes[i%len(sizes)]]
+		binary.BigEndian.PutUint16(b, uint16(i))
+		for j := 2; j < len(b); j++ {
+			b[j] = byte(i)
+		}
+		return b
+	}
+
+	buf := make([]byte, 1000)
+	for i := 0; i < num; i++ {
+		require.NoError(t, clientConn.SendDatagram(payload(buf, i)))
+	}
+	var received int
+	seen := make([]bool, num)
+	want := make([]byte, 1000)
+	for received < num {
+		got, err := serverConn.ReceiveDatagram(ctx)
+		if err != nil {
+			break
+		}
+		require.GreaterOrEqual(t, len(got), 2)
+		i := int(binary.BigEndian.Uint16(got))
+		require.Less(t, i, num)
+		require.False(t, seen[i], "datagram %d arrived again", i)
+		seen[i] = true
+		require.Equal(t, payload(want, i), got)
+		quic.ReleaseDatagram(got)
+		received++
+	}
+	t.Logf("received %d of %d datagrams", received, num)
+	require.Greater(t, received, num/2)
 }
 
 // Datagrams of changing sizes go out in GSO batches. The sender must not drop any of them.

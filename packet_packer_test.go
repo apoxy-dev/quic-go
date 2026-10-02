@@ -616,6 +616,7 @@ func TestPackLargeDatagramFrame(t *testing.T) {
 	p, err = tp.packer.AppendPacket(buffer, newMaxPacketSize, time.Now(), protocol.Version1)
 	require.ErrorIs(t, err, errNothingToPack)
 	require.Nil(t, tp.datagramQueue.Peek()) // make sure the frame is gone
+	require.Nil(t, f.Data)                  // the data went back to the pool
 }
 
 func TestPackRetransmissions(t *testing.T) {

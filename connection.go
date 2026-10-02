@@ -2448,6 +2448,7 @@ func (s *connection) registerPackedShortHeaderPacket(p shortHeaderPacket, ecn pr
 		p.IsPathMTUProbePacket,
 		false,
 	)
+	releaseSentDatagrams(p.Frames)
 	s.connIDManager.SentPacket()
 }
 
@@ -2473,6 +2474,7 @@ func (s *connection) sendPackedCoalescedPacket(packet *coalescedPacket, ecn prot
 			false,
 			false,
 		)
+		releaseSentDatagrams(p.frames)
 		if s.perspective == protocol.PerspectiveClient && p.EncryptionLevel() == protocol.EncryptionHandshake &&
 			!s.droppedInitialKeys {
 			// On the client side, Initial keys are dropped as soon as the first Handshake packet is sent.
@@ -2502,6 +2504,7 @@ func (s *connection) sendPackedCoalescedPacket(packet *coalescedPacket, ecn prot
 			p.IsPathMTUProbePacket,
 			false,
 		)
+		releaseSentDatagrams(p.Frames)
 	}
 	s.connIDManager.SentPacket()
 	s.sendQueue.Send(packet.buffer, 0, ecn)
@@ -2662,9 +2665,13 @@ func (s *connection) SendDatagram(p []byte) error {
 	if protocol.ByteCount(len(p)) > maxDataLen {
 		return &DatagramTooLargeError{MaxDatagramPayloadSize: int64(maxDataLen)}
 	}
-	f.Data = make([]byte, len(p))
+	f.Data = getDatagramBuffer(len(p))
 	copy(f.Data, p)
-	return s.datagramQueue.Add(f)
+	if err := s.datagramQueue.Add(f); err != nil {
+		ReleaseDatagram(f.Data)
+		return err
+	}
+	return nil
 }
 
 func (s *connection) ReceiveDatagram(ctx context.Context) ([]byte, error) {

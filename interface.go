@@ -194,6 +194,7 @@ type Connection interface {
 	// The payload of the datagram needs to fit into a single QUIC packet.
 	// In addition, a datagram may be dropped before being sent out if the available packet size suddenly decreases.
 	// If the payload is too large to be sent at the current time, a DatagramTooLargeError is returned.
+	// SendDatagram copies the payload, so the caller can use it again when the call returns.
 	SendDatagram(payload []byte) error
 	// ReceiveDatagram gets a message received in a datagram, as specified in RFC 9221.
 	// The caller can give the message back with ReleaseDatagram when it does not use it any more.

@@ -75,3 +75,40 @@ func BenchmarkStreamChurn(b *testing.B) {
 		require.NoError(b, str.Close())
 	}
 }
+
+// BenchmarkDatagram sends 1000 B datagrams to a server that releases them.
+// The allocations are for both endpoints.
+func BenchmarkDatagram(b *testing.B) {
+	b.ReportAllocs()
+
+	ln, err := quic.Listen(newUDPConnLocalhost(b), tlsConfig, &quic.Config{EnableDatagrams: true})
+	require.NoError(b, err)
+	defer ln.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	conn, err := quic.Dial(ctx, newUDPConnLocalhost(b), ln.Addr(), tlsClientConfig, &quic.Config{EnableDatagrams: true})
+	require.NoError(b, err)
+	defer conn.CloseWithError(0, "")
+
+	serverConn, err := ln.Accept(ctx)
+	require.NoError(b, err)
+	defer serverConn.CloseWithError(0, "")
+	go func() {
+		for {
+			d, err := serverConn.ReceiveDatagram(context.Background())
+			if err != nil {
+				return
+			}
+			quic.ReleaseDatagram(d)
+		}
+	}()
+
+	p := make([]byte, 1000)
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if err := conn.SendDatagram(p); err != nil {
+			b.Fatal(err)
+		}
+	}
+}

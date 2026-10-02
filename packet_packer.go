@@ -665,6 +665,7 @@ func (p *packetPacker) composeNextPacket(
 				// Discard this frame. There's no point in retrying this in the next packet,
 				// as it's unlikely that the available packet size will increase.
 				p.datagramQueue.Pop()
+				releaseDatagramFrame(f)
 			}
 			// If the DATAGRAM frame was too large and the packet contained an ACK, we'll try to send it out later.
 		}
