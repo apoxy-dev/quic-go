@@ -46,6 +46,13 @@ func isSendMsgSizeErr(err error) bool {
 	return errors.Is(err, windows.WSAEMSGSIZE)
 }
 
+// isNoRouteErr reports whether a send failed because the host has no route or
+// no source address for the peer.
+func isNoRouteErr(err error) bool {
+	return errors.Is(err, windows.WSAENETUNREACH) || errors.Is(err, windows.WSAEHOSTUNREACH) ||
+		errors.Is(err, windows.WSAENETDOWN) || errors.Is(err, windows.WSAEADDRNOTAVAIL)
+}
+
 func isRecvMsgSizeErr(err error) bool {
 	// https://docs.microsoft.com/en-us/windows/win32/winsock/windows-sockets-error-codes-2
 	return errors.Is(err, windows.WSAEMSGSIZE)

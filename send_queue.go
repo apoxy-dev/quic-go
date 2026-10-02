@@ -92,7 +92,8 @@ func (h *sendQueue) Run() error {
 				// 1. Checking for "datagram too large" message from the kernel, as such,
 				// 2. Path MTU discovery,and
 				// 3. Eventual detection of loss PingFrame.
-				if !isSendMsgSizeErr(err) {
+				// With no route, the packet is lost. Loss recovery sends the data again.
+				if !isSendMsgSizeErr(err) && !isNoRouteErr(err) {
 					return err
 				}
 			}
