@@ -131,8 +131,6 @@ func newConn(c OOBCapablePacketConn, supportsDF bool) (*oobConn, error) {
 	var bc batchConn
 	if ibc, ok := c.(batchConn); ok {
 		bc = ibc
-	} else if mc := newMmsgConn(rawConn, c.LocalAddr()); mc != nil {
-		bc = mc
 	} else {
 		bc = ipv4.NewPacketConn(c)
 	}
