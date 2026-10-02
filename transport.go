@@ -52,6 +52,7 @@ type closePacket struct {
 // for dialing an arbitrary number of outgoing connections.
 // A Transport handles a single net.PacketConn, and offers a range of configuration options
 // compared to the simple helper functions like [Listen] and [Dial] that this package provides.
+// Many received packets can share one remote address value, so do not modify the addresses that it gives.
 type Transport struct {
 	// A single net.PacketConn can only be handled by one Transport.
 	// Bad things will happen if passed to multiple Transports.
