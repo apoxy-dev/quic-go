@@ -904,6 +904,58 @@ func TestConnectionMaxUnprocessedPackets(t *testing.T) {
 	})
 }
 
+func TestConnectionDropsOldQueuedPackets(t *testing.T) {
+	const wakeup = protocol.MaxPacketsPerWakeup
+	tests := []struct {
+		name          string
+		handshakeDone bool
+		queued        int // The packets in the queue. They all have the same age.
+		age           time.Duration
+		wantHandled   int // The packets that one wakeup takes from the queue.
+		wantAgeDrops  int
+	}{
+		{"new packet", true, 1, 0, 1, 0},
+		{"old packet in a short queue", true, 1, 2 * protocol.MaxQueuedPacketAge, 1, 0},
+		{"old packets in a queue of one wakeup", true, wakeup, 2 * protocol.MaxQueuedPacketAge, wakeup, 0},
+		{"old packets in a long queue", true, wakeup + 1, 2 * protocol.MaxQueuedPacketAge, wakeup, wakeup},
+		{"old packets in a long queue during the handshake", false, wakeup + 1, 2 * protocol.MaxQueuedPacketAge, wakeup, 0},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			mockCtrl := gomock.NewController(t)
+			var eventRecorder events.Recorder
+			unpacker := NewMockUnpacker(mockCtrl)
+			opts := []testConnectionOpt{connectionOptTracer(&eventRecorder), connectionOptUnpacker(unpacker)}
+			if test.handshakeDone {
+				opts = append(opts, connectionOptHandshakeConfirmed())
+			}
+			tc := newServerTestConnection(t, mockCtrl, nil, false, opts...)
+
+			for range test.queued {
+				p := getShortHeaderPacket(t, tc.remoteAddr, tc.srcConnID, 1, []byte("foobar"))
+				p.rcvTime = monotime.Now().Add(-test.age)
+				tc.conn.handlePacket(p)
+			}
+			// The connection unpacks only the packets that it does not drop because of their age.
+			unpacked := test.wantHandled - test.wantAgeDrops
+			unpacker.EXPECT().UnpackShortHeader(gomock.Any(), gomock.Any()).Return(
+				protocol.PacketNumber(0), protocol.PacketNumberLen(0), protocol.KeyPhaseBit(0), nil, handshake.ErrDecryptionFailed,
+			).Times(unpacked)
+
+			_, err := tc.conn.handlePackets()
+			require.NoError(t, err)
+			drops := make(map[qlog.PacketDropReason]int)
+			for _, ev := range eventRecorder.Events(qlog.PacketDropped{}) {
+				drops[ev.(qlog.PacketDropped).Trigger]++
+			}
+			require.Equal(t, unpacked, drops[qlog.PacketDropPayloadDecryptError])
+			require.Equal(t, test.wantAgeDrops, drops[qlog.PacketDropDOSPrevention])
+			require.Equal(t, uint64(test.wantAgeDrops), tc.conn.queueAgeDrops.Load())
+			require.Equal(t, test.queued-test.wantHandled, tc.conn.receivedPackets.Len())
+		})
+	}
+}
+
 func TestConnectionRemoteClose(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		mockCtrl := gomock.NewController(t)

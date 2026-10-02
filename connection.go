@@ -1015,9 +1015,9 @@ func (c *Conn) handlePackets() (wasProcessed bool, _ error) {
 		c.receivedPacketMx.Unlock()
 		return false, nil
 	}
-	// After the handshake, drop the packets that waited too long in the queue.
+	// After the handshake, drop the packets that waited too long in a queue that one wakeup does not drain.
 	// A monotime.Time can be negative, so the zero value cannot mean "no limit".
-	dropOld := c.handshakeComplete
+	dropOld := c.handshakeComplete && c.receivedPackets.Len() > protocol.MaxPacketsPerWakeup
 	oldest := monotime.Now().Add(-protocol.MaxQueuedPacketAge)
 
 	var hasMorePackets bool

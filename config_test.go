@@ -124,7 +124,7 @@ func configWithNonZeroNonFunctionFields(t *testing.T) *Config {
 			f.Set(reflect.ValueOf(uint16(1350)))
 		case "DisablePathMTUDiscovery":
 			f.Set(reflect.ValueOf(true))
-		case "Allow0RTT":
+		case "Allow0RTT", "DisableCongestionControl":
 			f.Set(reflect.ValueOf(true))
 		case "EnableStreamResetPartialDelivery":
 			f.Set(reflect.ValueOf(true))
