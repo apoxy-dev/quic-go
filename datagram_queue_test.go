@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	"github.com/quic-go/quic-go/integrationtests/tools/israce"
+	"github.com/quic-go/quic-go/internal/ackhandler"
 	"github.com/quic-go/quic-go/internal/protocol"
 	"github.com/quic-go/quic-go/internal/synctest"
 	"github.com/quic-go/quic-go/internal/utils"
@@ -266,4 +267,14 @@ func BenchmarkDatagramQueueReceive(b *testing.B) {
 			}
 		})
 	}
+}
+
+func TestReleaseSentDatagrams(t *testing.T) {
+	df := &wire.DatagramFrame{Data: getDatagramBuffer(100)}
+	ping := &wire.PingFrame{}
+	frames := []ackhandler.Frame{{Frame: ping}, {Frame: df}, {}}
+	releaseSentDatagrams(frames)
+	require.Nil(t, df.Data)
+	require.Equal(t, ping, frames[0].Frame)
+	require.Nil(t, frames[2].Frame)
 }

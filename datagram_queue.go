@@ -5,6 +5,7 @@ import (
 	"sync"
 	"sync/atomic"
 
+	"github.com/quic-go/quic-go/internal/ackhandler"
 	"github.com/quic-go/quic-go/internal/protocol"
 	"github.com/quic-go/quic-go/internal/utils"
 	"github.com/quic-go/quic-go/internal/utils/ringbuffer"
@@ -48,6 +49,21 @@ func ReleaseDatagram(b []byte) {
 		smallDatagramPool.Put((*[smallDatagramSize]byte)(b[:smallDatagramSize]))
 	case protocol.MaxPacketBufferSize:
 		datagramPool.Put((*[protocol.MaxPacketBufferSize]byte)(b[:protocol.MaxPacketBufferSize]))
+	}
+}
+
+// releaseDatagramFrame gives the data of a DATAGRAM frame that is sent or dropped back to the pool.
+func releaseDatagramFrame(f *wire.DatagramFrame) {
+	ReleaseDatagram(f.Data)
+	f.Data = nil
+}
+
+// releaseSentDatagrams releases the DATAGRAM frames of a sent packet.
+func releaseSentDatagrams(frames []ackhandler.Frame) {
+	for _, f := range frames {
+		if df, ok := f.Frame.(*wire.DatagramFrame); ok {
+			releaseDatagramFrame(df)
+		}
 	}
 }
 

@@ -2834,6 +2834,7 @@ func (c *Conn) registerPackedShortHeaderPacket(p shortHeaderPacket, ecn protocol
 		p.IsPathMTUProbePacket,
 		false,
 	)
+	releaseSentDatagrams(p.Frames)
 	c.connIDManager.SentPacket()
 }
 
@@ -2859,6 +2860,7 @@ func (c *Conn) sendPackedCoalescedPacket(packet *coalescedPacket, ecn protocol.E
 			false,
 			false,
 		)
+		releaseSentDatagrams(p.frames)
 		if c.perspective == protocol.PerspectiveClient && p.EncryptionLevel() == protocol.EncryptionHandshake &&
 			!c.droppedInitialKeys {
 			// On the client side, Initial keys are dropped as soon as the first Handshake packet is sent.
@@ -2888,6 +2890,7 @@ func (c *Conn) sendPackedCoalescedPacket(packet *coalescedPacket, ecn protocol.E
 			p.IsPathMTUProbePacket,
 			false,
 		)
+		releaseSentDatagrams(p.Frames)
 	}
 	c.connIDManager.SentPacket()
 	c.sendQueue.Send(packet.buffer, 0, ecn)
@@ -3076,6 +3079,7 @@ func (c *Conn) onStreamCompleted(id protocol.StreamID) {
 // The payload of the datagram needs to fit into a single QUIC packet.
 // In addition, a datagram may be dropped before being sent out if the available packet size suddenly decreases.
 // If the payload is too large to be sent at the current time, a DatagramTooLargeError is returned.
+// SendDatagram copies the payload, so the caller can use it again when the call returns.
 func (c *Conn) SendDatagram(p []byte) error {
 	if !c.supportsDatagrams() {
 		return errors.New("datagram support disabled")
@@ -3091,12 +3095,17 @@ func (c *Conn) SendDatagram(p []byte) error {
 	if protocol.ByteCount(len(p)) > maxDataLen {
 		return &DatagramTooLargeError{MaxDatagramPayloadSize: int64(maxDataLen)}
 	}
-	f.Data = make([]byte, len(p))
+	f.Data = getDatagramBuffer(len(p))
 	copy(f.Data, p)
-	return c.datagramQueue.Add(f)
+	if err := c.datagramQueue.Add(f); err != nil {
+		ReleaseDatagram(f.Data)
+		return err
+	}
+	return nil
 }
 
 // ReceiveDatagram gets a message received in a QUIC datagram, as specified in RFC 9221.
+// The caller can give the message back with ReleaseDatagram when it does not use it any more.
 func (c *Conn) ReceiveDatagram(ctx context.Context) ([]byte, error) {
 	if !c.config.EnableDatagrams {
 		return nil, errors.New("datagram support disabled")
