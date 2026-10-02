@@ -5,6 +5,7 @@ package quic
 import (
 	"fmt"
 	"net"
+	"strings"
 	"testing"
 	"time"
 
@@ -308,6 +309,82 @@ func TestReadsMultipleMessagesInOneBatch(t *testing.T) {
 		require.Equal(t, fmt.Sprintf("message %d", i), string(p.data))
 	}
 	require.Equal(t, 2, bc.callCounter)
+}
+
+// batchReader returns reads of sizes[i] non-QUIC packets, then net.ErrClosed.
+type batchReader struct{ sizes []int }
+
+func (c *batchReader) ReadBatch(ms []ipv4.Message, _ int) (int, error) {
+	if len(c.sizes) == 0 {
+		return 0, net.ErrClosed
+	}
+	n := c.sizes[0]
+	c.sizes = c.sizes[1:]
+	for i := range n {
+		ms[i].Buffers[0][0] = 1 // The QUIC bit is not set.
+		ms[i].N = 1
+	}
+	return n, nil
+}
+
+// singleReader returns n non-QUIC packets, then net.ErrClosed.
+type singleReader struct {
+	net.PacketConn
+	n int
+}
+
+func (c *singleReader) ReadFrom(b []byte) (int, net.Addr, error) {
+	if c.n == 0 {
+		return 0, nil, net.ErrClosed
+	}
+	c.n--
+	b[0] = 1
+	return 1, &net.UDPAddr{}, nil
+}
+
+func TestTransportNonQUICBatchEnd(t *testing.T) {
+	cases := []struct {
+		name  string
+		sizes []int
+		conn  func(t *testing.T, sizes []int) net.PacketConn
+	}{
+		{
+			name:  "batched reads",
+			sizes: []int{batchSize, 1, batchSize/2 + 1},
+			conn: func(t *testing.T, sizes []int) net.PacketConn {
+				c, err := newConn(newUDPConnLocalhost(t), true)
+				require.NoError(t, err)
+				c.batchConn = &batchReader{sizes: sizes}
+				return c
+			},
+		},
+		{
+			name:  "single reads",
+			sizes: []int{1, 1, 1},
+			conn: func(t *testing.T, sizes []int) net.PacketConn {
+				t.Setenv("QUIC_GO_DISABLE_RECEIVE_BUFFER_WARNING", "true")
+				return &singleReader{PacketConn: newUDPConnLocalhost(t), n: len(sizes)}
+			},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			// p is one packet, and e is one batch end.
+			var want, got strings.Builder
+			for _, n := range tc.sizes {
+				want.WriteString(strings.Repeat("p", n) + "e")
+			}
+			tr := &Transport{
+				Conn:                 tc.conn(t, tc.sizes),
+				NonQUICPacketHandler: func([]byte, net.Addr) { got.WriteByte('p') },
+				NonQUICBatchEnd:      func() { got.WriteByte('e') },
+			}
+			require.NoError(t, tr.Start())
+			<-tr.listening // The read loop stops at net.ErrClosed.
+			require.NoError(t, tr.Close())
+			require.Equal(t, want.String(), got.String())
+		})
+	}
 }
 
 func TestSysConnSendGSO(t *testing.T) {
