@@ -234,12 +234,6 @@ func TestTransportStatelessResetSending(t *testing.T) {
 		StatelessResetKey:  &StatelessResetKey{1, 2, 3, 4},
 		Tracer:             tracer,
 	}
-	tr.init(true)
-	defer func() {
-		mockTracer.EXPECT().Close()
-		tr.Close()
-	}()
-
 	connID := protocol.ParseConnectionID([]byte{9, 10, 11, 12})
 
 	// now send a packet with a connection ID that doesn't exist
@@ -251,9 +245,15 @@ func TestTransportStatelessResetSending(t *testing.T) {
 	// no stateless reset sent for packets smaller than MinStatelessResetSize
 	dropped := make(chan struct{})
 	smallPacket := append(b, make([]byte, protocol.MinStatelessResetSize-len(b))...)
+	// Set the expectations before init. The listen goroutine reads them, and .Do is not safe while it runs.
 	mockTracer.EXPECT().DroppedPacket(conn.LocalAddr(), logging.PacketTypeNotDetermined, protocol.ByteCount(len(smallPacket)), logging.PacketDropUnknownConnectionID).Do(
 		func(net.Addr, logging.PacketType, protocol.ByteCount, logging.PacketDropReason) { close(dropped) },
 	)
+	tr.init(true)
+	defer func() {
+		mockTracer.EXPECT().Close()
+		tr.Close()
+	}()
 	_, err = conn.WriteTo(smallPacket, tr.Conn.LocalAddr())
 	require.NoError(t, err)
 	select {
@@ -283,18 +283,18 @@ func TestTransportUnparseableQUICPackets(t *testing.T) {
 		ConnectionIDLength: 10,
 		Tracer:             tracer,
 	}
+	conn := newUDPConnLocalhost(t)
+
+	dropped := make(chan struct{})
+	// Set the expectations before init. The listen goroutine reads them, and .Do is not safe while it runs.
+	mockTracer.EXPECT().DroppedPacket(conn.LocalAddr(), logging.PacketTypeNotDetermined, protocol.ByteCount(4), logging.PacketDropHeaderParseError).Do(
+		func(net.Addr, logging.PacketType, protocol.ByteCount, logging.PacketDropReason) { close(dropped) },
+	)
 	require.NoError(t, tr.init(true))
 	defer func() {
 		mockTracer.EXPECT().Close()
 		tr.Close()
 	}()
-
-	conn := newUDPConnLocalhost(t)
-
-	dropped := make(chan struct{})
-	mockTracer.EXPECT().DroppedPacket(conn.LocalAddr(), logging.PacketTypeNotDetermined, protocol.ByteCount(4), logging.PacketDropHeaderParseError).Do(
-		func(net.Addr, logging.PacketType, protocol.ByteCount, logging.PacketDropReason) { close(dropped) },
-	)
 	_, err := conn.WriteTo([]byte{0x40 /* set the QUIC bit */, 1, 2, 3}, tr.Conn.LocalAddr())
 	require.NoError(t, err)
 	select {
@@ -311,20 +311,26 @@ func TestTransportListening(t *testing.T) {
 		ConnectionIDLength: 5,
 		Tracer:             tracer,
 	}
-	require.NoError(t, tr.init(true))
-	defer func() {
-		mockTracer.EXPECT().Close()
-		tr.Close()
-	}()
-
 	conn := newUDPConnLocalhost(t)
 	data := wire.ComposeVersionNegotiation([]byte{1, 2, 3, 4, 5}, []byte{6, 7, 8, 9, 10}, []protocol.Version{protocol.Version1})
 	dropped := make(chan struct{}, 10)
+	lnDropped := make(chan struct{}, 10)
+	// Set the expectations before init. The listen goroutine reads them, and .Do is not safe while it runs.
 	mockTracer.EXPECT().DroppedPacket(conn.LocalAddr(), logging.PacketTypeNotDetermined, protocol.ByteCount(len(data)), logging.PacketDropUnknownConnectionID).Do(
 		func(net.Addr, logging.PacketType, protocol.ByteCount, logging.PacketDropReason) {
 			dropped <- struct{}{}
 		},
 	)
+	mockTracer.EXPECT().DroppedPacket(conn.LocalAddr(), logging.PacketTypeVersionNegotiation, protocol.ByteCount(len(data)), logging.PacketDropUnexpectedPacket).Do(
+		func(net.Addr, logging.PacketType, protocol.ByteCount, logging.PacketDropReason) {
+			lnDropped <- struct{}{}
+		},
+	)
+	require.NoError(t, tr.init(true))
+	defer func() {
+		mockTracer.EXPECT().Close()
+		tr.Close()
+	}()
 
 	_, err := conn.WriteTo(data, tr.Conn.LocalAddr())
 	require.NoError(t, err)
@@ -338,13 +344,6 @@ func TestTransportListening(t *testing.T) {
 	require.NoError(t, err)
 
 	// send the packet again
-	lnDropped := make(chan struct{}, 10)
-	mockTracer.EXPECT().DroppedPacket(conn.LocalAddr(), logging.PacketTypeVersionNegotiation, protocol.ByteCount(len(data)), logging.PacketDropUnexpectedPacket).Do(
-		func(net.Addr, logging.PacketType, protocol.ByteCount, logging.PacketDropReason) {
-			lnDropped <- struct{}{}
-		},
-	)
-
 	_, err = conn.WriteTo(data, tr.Conn.LocalAddr())
 	require.NoError(t, err)
 	select {
