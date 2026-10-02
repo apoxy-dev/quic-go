@@ -288,7 +288,7 @@ var newConnection = func(
 		protocol.ByteCount(s.config.InitialPacketSize),
 		s.rttStats,
 		clientAddressValidated,
-		s.conn.capabilities().ECN,
+		s.conn.capabilities().ECN && !s.config.DisableECN,
 		s.config.DisableCongestionControl,
 		s.perspective,
 		s.tracer,
@@ -402,7 +402,7 @@ var newClientConnection = func(
 		protocol.ByteCount(s.config.InitialPacketSize),
 		s.rttStats,
 		false, // has no effect
-		s.conn.capabilities().ECN,
+		s.conn.capabilities().ECN && !s.config.DisableECN,
 		s.config.DisableCongestionControl,
 		s.perspective,
 		s.tracer,

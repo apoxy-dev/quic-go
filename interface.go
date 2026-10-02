@@ -331,7 +331,9 @@ type Config struct {
 	// DisableCongestionControl replaces the Cubic congestion controller with one that always allows sending.
 	// Use it when an inner transport, for example TCP in a netstack, already controls congestion.
 	DisableCongestionControl bool
-	Tracer                   func(context.Context, logging.Perspective, ConnectionID) *logging.ConnectionTracer
+	// DisableECN sends all packets as Not-ECT, and the connection does not run ECN validation.
+	DisableECN bool
+	Tracer     func(context.Context, logging.Perspective, ConnectionID) *logging.ConnectionTracer
 }
 
 // ClientHelloInfo contains information about an incoming connection attempt.
