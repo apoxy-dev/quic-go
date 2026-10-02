@@ -49,7 +49,7 @@ const MaxServerUnprocessedPackets = 1024
 const MaxConnUnprocessedPackets = 16384
 
 // MaxQueuedPacketAge is the longest time that a packet can wait in the connection queue.
-// After the handshake, the connection drops older packets.
+// After the handshake, the connection drops older packets when more than MaxPacketsPerWakeup are queued.
 const MaxQueuedPacketAge = 10 * time.Millisecond
 
 // MaxPacketsPerWakeup is the max number of queued packets that the connection handles before it sends.

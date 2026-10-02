@@ -124,7 +124,7 @@ func configWithNonZeroNonFunctionFields(t *testing.T) *Config {
 			f.Set(reflect.ValueOf(uint16(1350)))
 		case "DisablePathMTUDiscovery":
 			f.Set(reflect.ValueOf(true))
-		case "Allow0RTT":
+		case "Allow0RTT", "DisableCongestionControl":
 			f.Set(reflect.ValueOf(true))
 		default:
 			t.Fatalf("all fields must be accounted for, but saw unknown field %q", fn)

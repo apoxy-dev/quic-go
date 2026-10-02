@@ -869,9 +869,9 @@ func (s *connection) handlePackets() (wasProcessed bool, _ error) {
 		s.receivedPacketMx.Unlock()
 		return false, nil
 	}
-	// After the handshake, drop the packets that waited too long in the queue.
+	// After the handshake, drop the packets that waited too long in a queue that one wakeup does not drain.
 	var oldest time.Time
-	if s.handshakeComplete {
+	if s.handshakeComplete && s.receivedPackets.Len() > protocol.MaxPacketsPerWakeup {
 		oldest = time.Now().Add(-protocol.MaxQueuedPacketAge)
 	}
 

@@ -933,34 +933,20 @@ func TestConnectionMaxUnprocessedPackets(t *testing.T) {
 }
 
 func TestConnectionDropsOldQueuedPackets(t *testing.T) {
+	const wakeup = protocol.MaxPacketsPerWakeup
 	tests := []struct {
 		name          string
 		handshakeDone bool
+		queued        int // The packets in the queue. They all have the same age.
 		age           time.Duration
-		wantType      logging.PacketType
-		wantReason    logging.PacketDropReason
-		wantAgeDrops  uint64
+		wantHandled   int // The packets that one wakeup takes from the queue.
+		wantAgeDrops  int
 	}{
-		{
-			name:          "new packet",
-			handshakeDone: true,
-			wantType:      logging.PacketType1RTT,
-			wantReason:    logging.PacketDropPayloadDecryptError,
-		},
-		{
-			name:          "old packet",
-			handshakeDone: true,
-			age:           2 * protocol.MaxQueuedPacketAge,
-			wantType:      logging.PacketTypeNotDetermined,
-			wantReason:    logging.PacketDropDOSPrevention,
-			wantAgeDrops:  1,
-		},
-		{
-			name:       "old packet during the handshake",
-			age:        2 * protocol.MaxQueuedPacketAge,
-			wantType:   logging.PacketType1RTT,
-			wantReason: logging.PacketDropPayloadDecryptError,
-		},
+		{"new packet", true, 1, 0, 1, 0},
+		{"old packet in a short queue", true, 1, 2 * protocol.MaxQueuedPacketAge, 1, 0},
+		{"old packets in a queue of one wakeup", true, wakeup, 2 * protocol.MaxQueuedPacketAge, wakeup, 0},
+		{"old packets in a long queue", true, wakeup + 1, 2 * protocol.MaxQueuedPacketAge, wakeup, wakeup},
+		{"old packets in a long queue during the handshake", false, wakeup + 1, 2 * protocol.MaxQueuedPacketAge, 1, 0},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -973,18 +959,25 @@ func TestConnectionDropsOldQueuedPackets(t *testing.T) {
 			}
 			tc := newServerTestConnection(t, mockCtrl, nil, false, opts...)
 
-			p := getShortHeaderPacket(t, tc.remoteAddr, tc.srcConnID, 1, []byte("foobar"))
-			p.rcvTime = time.Now().Add(-test.age)
+			var size protocol.ByteCount
+			for range test.queued {
+				p := getShortHeaderPacket(t, tc.remoteAddr, tc.srcConnID, 1, []byte("foobar"))
+				p.rcvTime = time.Now().Add(-test.age)
+				size = p.Size()
+				tc.conn.handlePacket(p)
+			}
 			// The connection unpacks only the packets that it does not drop because of their age.
+			unpacked := test.wantHandled - test.wantAgeDrops
 			unpacker.EXPECT().UnpackShortHeader(gomock.Any(), gomock.Any()).Return(
 				protocol.PacketNumber(0), protocol.PacketNumberLen(0), protocol.KeyPhaseBit(0), nil, handshake.ErrDecryptionFailed,
-			).MaxTimes(1)
-			tracer.EXPECT().DroppedPacket(test.wantType, protocol.InvalidPacketNumber, p.Size(), test.wantReason)
+			).Times(unpacked)
+			tracer.EXPECT().DroppedPacket(logging.PacketType1RTT, protocol.InvalidPacketNumber, size, logging.PacketDropPayloadDecryptError).Times(unpacked)
+			tracer.EXPECT().DroppedPacket(logging.PacketTypeNotDetermined, protocol.InvalidPacketNumber, size, logging.PacketDropDOSPrevention).Times(test.wantAgeDrops)
 
-			tc.conn.handlePacket(p)
 			_, err := tc.conn.handlePackets()
 			require.NoError(t, err)
-			require.Equal(t, test.wantAgeDrops, tc.conn.queueAgeDrops.Load())
+			require.Equal(t, uint64(test.wantAgeDrops), tc.conn.queueAgeDrops.Load())
+			require.Equal(t, test.queued-test.wantHandled, tc.conn.receivedPackets.Len())
 		})
 	}
 }
