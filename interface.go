@@ -196,6 +196,7 @@ type Connection interface {
 	// If the payload is too large to be sent at the current time, a DatagramTooLargeError is returned.
 	SendDatagram(payload []byte) error
 	// ReceiveDatagram gets a message received in a datagram, as specified in RFC 9221.
+	// The caller can give the message back with ReleaseDatagram when it does not use it any more.
 	ReceiveDatagram(context.Context) ([]byte, error)
 
 	AddPath(*Transport) (*Path, error)
@@ -327,12 +328,10 @@ type Config struct {
 	Allow0RTT bool
 	// Enable QUIC datagram support (RFC 9221).
 	EnableDatagrams bool
-	// DisableCongestionControl replaces the default Cubic congestion controller
-	// with a no-op that always allows sending. Use this when an inner transport
-	// (e.g. netstack TCP) already handles congestion control and QUIC CC would
-	// be redundant.
+	// DisableCongestionControl replaces the Cubic congestion controller with one that always allows sending.
+	// Use it when an inner transport, for example TCP in a netstack, already controls congestion.
 	DisableCongestionControl bool
-	Tracer          func(context.Context, logging.Perspective, ConnectionID) *logging.ConnectionTracer
+	Tracer                   func(context.Context, logging.Perspective, ConnectionID) *logging.ConnectionTracer
 }
 
 // ClientHelloInfo contains information about an incoming connection attempt.
@@ -366,4 +365,10 @@ type ConnectionState struct {
 	Version Version
 	// GSO says if generic segmentation offload is used.
 	GSO bool
+	// QueueFullDrops is the number of received packets that the connection dropped because its queue was full.
+	QueueFullDrops uint64
+	// QueueAgeDrops is the number of received packets that the connection dropped because they waited too long in its queue.
+	QueueAgeDrops uint64
+	// DatagramQueueDrops is the number of received datagrams that the connection dropped because the application did not read them in time.
+	DatagramQueueDrops uint64
 }

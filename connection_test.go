@@ -918,16 +918,74 @@ func TestConnectionMaxUnprocessedPackets(t *testing.T) {
 
 	for i := protocol.PacketNumber(0); i < protocol.MaxConnUnprocessedPackets; i++ {
 		// nothing here should block
-		tc.conn.handlePacket(receivedPacket{data: []byte("foobar")})
+		tc.conn.handlePacket(receivedPacket{data: []byte("foobar"), buffer: getPacketBuffer()})
 	}
 	tracer.EXPECT().DroppedPacket(logging.PacketTypeNotDetermined, protocol.InvalidPacketNumber, logging.ByteCount(6), logging.PacketDropDOSPrevention).Do(func(logging.PacketType, logging.PacketNumber, logging.ByteCount, logging.PacketDropReason) {
 		close(done)
 	})
-	tc.conn.handlePacket(receivedPacket{data: []byte("foobar")})
+	tc.conn.handlePacket(receivedPacket{data: []byte("foobar"), buffer: getPacketBuffer()})
 	select {
 	case <-done:
 	case <-time.After(time.Second):
 		t.Fatal("timeout")
+	}
+	require.Equal(t, uint64(1), tc.conn.queueFullDrops.Load())
+}
+
+func TestConnectionDropsOldQueuedPackets(t *testing.T) {
+	tests := []struct {
+		name          string
+		handshakeDone bool
+		age           time.Duration
+		wantType      logging.PacketType
+		wantReason    logging.PacketDropReason
+		wantAgeDrops  uint64
+	}{
+		{
+			name:          "new packet",
+			handshakeDone: true,
+			wantType:      logging.PacketType1RTT,
+			wantReason:    logging.PacketDropPayloadDecryptError,
+		},
+		{
+			name:          "old packet",
+			handshakeDone: true,
+			age:           2 * protocol.MaxQueuedPacketAge,
+			wantType:      logging.PacketTypeNotDetermined,
+			wantReason:    logging.PacketDropDOSPrevention,
+			wantAgeDrops:  1,
+		},
+		{
+			name:       "old packet during the handshake",
+			age:        2 * protocol.MaxQueuedPacketAge,
+			wantType:   logging.PacketType1RTT,
+			wantReason: logging.PacketDropPayloadDecryptError,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			mockCtrl := gomock.NewController(t)
+			tr, tracer := mocklogging.NewMockConnectionTracer(mockCtrl)
+			unpacker := NewMockUnpacker(mockCtrl)
+			opts := []testConnectionOpt{connectionOptTracer(tr), connectionOptUnpacker(unpacker)}
+			if test.handshakeDone {
+				opts = append(opts, connectionOptHandshakeConfirmed())
+			}
+			tc := newServerTestConnection(t, mockCtrl, nil, false, opts...)
+
+			p := getShortHeaderPacket(t, tc.remoteAddr, tc.srcConnID, 1, []byte("foobar"))
+			p.rcvTime = time.Now().Add(-test.age)
+			// The connection unpacks only the packets that it does not drop because of their age.
+			unpacker.EXPECT().UnpackShortHeader(gomock.Any(), gomock.Any()).Return(
+				protocol.PacketNumber(0), protocol.PacketNumberLen(0), protocol.KeyPhaseBit(0), nil, handshake.ErrDecryptionFailed,
+			).MaxTimes(1)
+			tracer.EXPECT().DroppedPacket(test.wantType, protocol.InvalidPacketNumber, p.Size(), test.wantReason)
+
+			tc.conn.handlePacket(p)
+			_, err := tc.conn.handlePackets()
+			require.NoError(t, err)
+			require.Equal(t, test.wantAgeDrops, tc.conn.queueAgeDrops.Load())
+		})
 	}
 }
 
@@ -2149,7 +2207,7 @@ func TestConnectionGSOBatchPacketSize(t *testing.T) {
 	done := make(chan struct{})
 	gomock.InOrder(
 		tc.sendConn.EXPECT().Write(expectedData, uint16(maxPacketSize), protocol.ECT1),
-		tc.sendConn.EXPECT().Write([]byte("foobar"), uint16(maxPacketSize), protocol.ECT1).DoAndReturn(
+		tc.sendConn.EXPECT().Write([]byte("foobar"), uint16(len("foobar")), protocol.ECT1).DoAndReturn(
 			func([]byte, uint16, protocol.ECN) error { close(done); return nil },
 		),
 	)
@@ -2170,6 +2228,112 @@ func TestConnectionGSOBatchPacketSize(t *testing.T) {
 		require.NoError(t, err)
 	case <-time.After(3 * time.Second):
 		t.Fatal("timeout")
+	}
+}
+
+// A GSO batch with segments smaller than the maximum size continues only with a DATAGRAM that fits into a segment.
+func TestConnectionGSOBatchDatagramSize(t *testing.T) {
+	tests := []struct {
+		name string
+		// The test queues datagrams with these payload sizes.
+		datagrams []int
+		// The packer packs a packet of this size for each datagram.
+		packets []int
+		// AppendPacket gets these size limits. 0 is the max packet size.
+		wantSizes []protocol.ByteCount
+		// The connection writes with these GSO segment sizes.
+		wantGSO []uint16
+	}{
+		{
+			name:      "next datagram fits",
+			datagrams: []int{50, 50},
+			packets:   []int{100, 100},
+			wantSizes: []protocol.ByteCount{0, 100, 0},
+			wantGSO:   []uint16{100},
+		},
+		{
+			name:      "next datagram does not fit",
+			datagrams: []int{50, 1000},
+			packets:   []int{100, 1050},
+			wantSizes: []protocol.ByteCount{0, 0, 0},
+			wantGSO:   []uint16{100, 1050},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			mockCtrl := gomock.NewController(t)
+			sph := mockackhandler.NewMockSentPacketHandler(mockCtrl)
+			tc := newServerTestConnection(t,
+				mockCtrl,
+				nil,
+				true,
+				connectionOptHandshakeConfirmed(),
+				connectionOptSentPacketHandler(sph),
+			)
+			sph.EXPECT().SendMode(gomock.Any()).Return(ackhandler.SendAny).AnyTimes()
+			sph.EXPECT().TimeUntilSend().Return(time.Time{}).AnyTimes()
+			sph.EXPECT().SentPacket(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).AnyTimes()
+			sph.EXPECT().GetLossDetectionTimeout().Return(time.Time{}).AnyTimes()
+			sph.EXPECT().ECNMode(gomock.Any()).Return(protocol.ECT1).AnyTimes()
+			sph.EXPECT().PeekPacketNumber(protocol.Encryption1RTT).Return(protocol.PacketNumber(1), protocol.PacketNumberLen2).AnyTimes()
+
+			for _, n := range test.datagrams {
+				require.NoError(t, tc.conn.datagramQueue.Add(&wire.DatagramFrame{DataLenPresent: true, Data: make([]byte, n)}))
+			}
+			maxPacketSize := tc.conn.maxPacketSize()
+			var sizes []protocol.ByteCount
+			var finished bool
+			packets := test.packets
+			done := make(chan struct{})
+			tc.packer.EXPECT().AppendPacket(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).DoAndReturn(
+				func(buffer *packetBuffer, size protocol.ByteCount, _ time.Time, _ protocol.Version) (shortHeaderPacket, error) {
+					// The run loop can try to send again after the test is done.
+					if finished {
+						return shortHeaderPacket{}, errNothingToPack
+					}
+					if size == maxPacketSize {
+						size = 0
+					}
+					sizes = append(sizes, size)
+					if len(packets) == 0 {
+						finished = true
+						close(done)
+						return shortHeaderPacket{}, errNothingToPack
+					}
+					tc.conn.datagramQueue.Pop()
+					buffer.Data = append(buffer.Data, make([]byte, packets[0])...)
+					packets = packets[1:]
+					return shortHeaderPacket{}, nil
+				},
+			).MinTimes(len(test.wantSizes))
+			var gso []uint16
+			tc.sendConn.EXPECT().Write(gomock.Any(), gomock.Any(), protocol.ECT1).DoAndReturn(
+				func(_ []byte, size uint16, _ protocol.ECN) error {
+					gso = append(gso, size)
+					return nil
+				},
+			).Times(len(test.wantGSO))
+
+			// The datagrams that Add queued schedule sending.
+			errChan := make(chan error, 1)
+			go func() { errChan <- tc.conn.run() }()
+			select {
+			case <-done:
+			case <-time.After(time.Second):
+				t.Fatal("timeout")
+			}
+
+			tc.connRunner.EXPECT().Remove(gomock.Any()).AnyTimes()
+			tc.conn.destroy(nil)
+			select {
+			case err := <-errChan:
+				require.NoError(t, err)
+			case <-time.After(3 * time.Second):
+				t.Fatal("timeout")
+			}
+			require.Equal(t, test.wantSizes, sizes)
+			require.Equal(t, test.wantGSO, gso)
+		})
 	}
 }
 
@@ -2227,7 +2391,7 @@ func TestConnectionGSOBatchECN(t *testing.T) {
 
 	done3 := make(chan struct{})
 	tc.sendConn.EXPECT().Write(expectedData, uint16(maxPacketSize), protocol.ECT1)
-	tc.sendConn.EXPECT().Write([]byte("foobar"), uint16(maxPacketSize), protocol.ECNCE).DoAndReturn(
+	tc.sendConn.EXPECT().Write([]byte("foobar"), uint16(len("foobar")), protocol.ECNCE).DoAndReturn(
 		func([]byte, uint16, protocol.ECN) error { close(done3); return nil },
 	)
 

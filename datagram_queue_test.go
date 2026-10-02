@@ -1,10 +1,14 @@
 package quic
 
 import (
+	"bytes"
 	"context"
+	"strconv"
 	"testing"
 	"time"
 
+	"github.com/quic-go/quic-go/integrationtests/tools/israce"
+	"github.com/quic-go/quic-go/internal/protocol"
 	"github.com/quic-go/quic-go/internal/utils"
 	"github.com/quic-go/quic-go/internal/wire"
 
@@ -157,5 +161,90 @@ func TestDatagramQueueClose(t *testing.T) {
 		require.ErrorIs(t, err, assert.AnError)
 	case <-time.After(time.Second):
 		t.Fatal("timeout")
+	}
+}
+
+func TestDatagramQueueReceiveQueueFull(t *testing.T) {
+	queue := newDatagramQueue(func() {}, utils.DefaultLogger)
+	for i := 0; i < maxDatagramRcvQueueLen; i++ {
+		queue.HandleDatagramFrame(&wire.DatagramFrame{Data: []byte{byte(i)}})
+	}
+	queue.HandleDatagramFrame(&wire.DatagramFrame{Data: []byte("dropped")})
+	require.Equal(t, uint64(1), queue.rcvDrops.Load())
+
+	// The queue accepts a datagram again after Receive takes one.
+	data, err := queue.Receive(context.Background())
+	require.NoError(t, err)
+	require.Equal(t, []byte{0}, data)
+	queue.HandleDatagramFrame(&wire.DatagramFrame{Data: []byte("foobar")})
+	require.Equal(t, uint64(1), queue.rcvDrops.Load())
+}
+
+func TestDatagramBuffers(t *testing.T) {
+	tests := []struct {
+		size    int
+		wantCap int
+		pooled  bool
+	}{
+		{size: 0, wantCap: smallDatagramSize, pooled: true},
+		{size: smallDatagramSize, wantCap: smallDatagramSize, pooled: true},
+		{size: smallDatagramSize + 1, wantCap: protocol.MaxPacketBufferSize, pooled: true},
+		{size: protocol.MaxPacketBufferSize, wantCap: protocol.MaxPacketBufferSize, pooled: true},
+		{size: protocol.MaxPacketBufferSize + 1, wantCap: protocol.MaxPacketBufferSize + 1},
+	}
+	for _, test := range tests {
+		t.Run(strconv.Itoa(test.size), func(t *testing.T) {
+			queue := newDatagramQueue(func() {}, utils.DefaultLogger)
+			data := bytes.Repeat([]byte{'a'}, test.size)
+			queue.HandleDatagramFrame(&wire.DatagramFrame{Data: data})
+			got, err := queue.Receive(context.Background())
+			require.NoError(t, err)
+			require.Equal(t, data, got)
+			require.Equal(t, test.wantCap, cap(got))
+			// The queue keeps a copy, not the frame data.
+			if test.size > 0 {
+				data[0] = 'b'
+				require.NotEqual(t, data, got)
+			}
+			ReleaseDatagram(got)
+
+			if israce.Enabled {
+				t.Skip("sync.Pool drops buffers when the race detector is on")
+			}
+			allocs := testing.AllocsPerRun(100, func() {
+				queue.HandleDatagramFrame(&wire.DatagramFrame{Data: data})
+				b, _ := queue.Receive(context.Background())
+				ReleaseDatagram(b)
+			})
+			if test.pooled {
+				require.Zero(t, allocs)
+			} else {
+				require.Equal(t, float64(1), allocs)
+			}
+		})
+	}
+}
+
+func BenchmarkDatagramQueueReceive(b *testing.B) {
+	for _, release := range []bool{false, true} {
+		name := "keep"
+		if release {
+			name = "release"
+		}
+		b.Run(name, func(b *testing.B) {
+			queue := newDatagramQueue(func() {}, utils.DefaultLogger)
+			f := &wire.DatagramFrame{Data: make([]byte, 1350)}
+			b.ReportAllocs()
+			for i := 0; i < b.N; i++ {
+				queue.HandleDatagramFrame(f)
+				data, err := queue.Receive(context.Background())
+				if err != nil {
+					b.Fatal(err)
+				}
+				if release {
+					ReleaseDatagram(data)
+				}
+			}
+		})
 	}
 }

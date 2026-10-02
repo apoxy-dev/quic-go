@@ -153,7 +153,7 @@ type connection struct {
 	packer        packer
 	mtuDiscoverer mtuDiscoverer // initialized when the transport parameters are received
 
-	currentMTUEstimate atomic.Uint32
+	maxPayloadSizeEstimate atomic.Uint32
 
 	initialStream       *initialCryptoStream
 	handshakeStream     *cryptoStream
@@ -164,6 +164,8 @@ type connection struct {
 	sendingScheduled     chan struct{}
 	receivedPacketMx     sync.Mutex
 	receivedPackets      ringbuffer.RingBuffer[receivedPacket]
+	queueFullDrops       atomic.Uint64
+	queueAgeDrops        atomic.Uint64
 
 	// closeChan is used to notify the run loop that it should terminate
 	closeChan chan struct{}
@@ -292,7 +294,7 @@ var newConnection = func(
 		s.tracer,
 		s.logger,
 	)
-	s.currentMTUEstimate.Store(uint32(estimateMaxPayloadSize(protocol.ByteCount(s.config.InitialPacketSize))))
+	s.maxPayloadSizeEstimate.Store(uint32(estimateMaxPayloadSize(protocol.ByteCount(s.config.InitialPacketSize))))
 	statelessResetToken := statelessResetter.GetStatelessResetToken(srcConnID)
 	params := &wire.TransportParameters{
 		InitialMaxStreamDataBidiLocal:   protocol.ByteCount(s.config.InitialStreamReceiveWindow),
@@ -406,7 +408,7 @@ var newClientConnection = func(
 		s.tracer,
 		s.logger,
 	)
-	s.currentMTUEstimate.Store(uint32(estimateMaxPayloadSize(protocol.ByteCount(s.config.InitialPacketSize))))
+	s.maxPayloadSizeEstimate.Store(uint32(estimateMaxPayloadSize(protocol.ByteCount(s.config.InitialPacketSize))))
 	oneRTTStream := newCryptoStream()
 	params := &wire.TransportParameters{
 		InitialMaxStreamDataBidiRemote: protocol.ByteCount(s.config.InitialStreamReceiveWindow),
@@ -725,6 +727,9 @@ func (s *connection) ConnectionState() ConnectionState {
 	s.connState.TLS = cs.ConnectionState
 	s.connState.Used0RTT = cs.Used0RTT
 	s.connState.GSO = s.conn.capabilities().GSO
+	s.connState.QueueFullDrops = s.queueFullDrops.Load()
+	s.connState.QueueAgeDrops = s.queueAgeDrops.Load()
+	s.connState.DatagramQueueDrops = s.datagramQueue.rcvDrops.Load()
 	return s.connState
 }
 
@@ -859,10 +864,15 @@ func (s *connection) handlePackets() (wasProcessed bool, _ error) {
 	// Limit the number of packets to the length of the receivedPackets channel,
 	// so we eventually get a chance to send out an ACK when receiving a lot of packets.
 	s.receivedPacketMx.Lock()
-	numPackets := s.receivedPackets.Len()
+	numPackets := min(s.receivedPackets.Len(), protocol.MaxPacketsPerWakeup)
 	if numPackets == 0 {
 		s.receivedPacketMx.Unlock()
 		return false, nil
+	}
+	// After the handshake, drop the packets that waited too long in the queue.
+	var oldest time.Time
+	if s.handshakeComplete {
+		oldest = time.Now().Add(-protocol.MaxQueuedPacketAge)
 	}
 
 	var hasMorePackets bool
@@ -874,12 +884,17 @@ func (s *connection) handlePackets() (wasProcessed bool, _ error) {
 		hasMorePackets = !s.receivedPackets.Empty()
 		s.receivedPacketMx.Unlock()
 
-		processed, err := s.handleOnePacket(p)
-		if err != nil {
-			return false, err
-		}
-		if processed {
-			wasProcessed = true
+		if p.rcvTime.Before(oldest) {
+			s.queueAgeDrops.Add(1)
+			s.dropQueuedPacket(p)
+		} else {
+			processed, err := s.handleOnePacket(p)
+			if err != nil {
+				return false, err
+			}
+			if processed {
+				wasProcessed = true
+			}
 		}
 		if !hasMorePackets {
 			break
@@ -1547,10 +1562,9 @@ func (s *connection) handlePacket(p receivedPacket) {
 	// Discard packets once the amount of queued packets is larger than
 	// the channel size, protocol.MaxConnUnprocessedPackets
 	if s.receivedPackets.Len() >= protocol.MaxConnUnprocessedPackets {
-		if s.tracer != nil && s.tracer.DroppedPacket != nil {
-			s.tracer.DroppedPacket(logging.PacketTypeNotDetermined, protocol.InvalidPacketNumber, p.Size(), logging.PacketDropDOSPrevention)
-		}
 		s.receivedPacketMx.Unlock()
+		s.queueFullDrops.Add(1)
+		s.dropQueuedPacket(p)
 		return
 	}
 	s.receivedPackets.PushBack(p)
@@ -1560,6 +1574,15 @@ func (s *connection) handlePacket(p receivedPacket) {
 	case s.notifyReceivedPacket <- struct{}{}:
 	default:
 	}
+}
+
+// dropQueuedPacket drops a packet that the connection did not process, and releases its buffer.
+func (s *connection) dropQueuedPacket(p receivedPacket) {
+	if s.tracer != nil && s.tracer.DroppedPacket != nil {
+		s.tracer.DroppedPacket(logging.PacketTypeNotDetermined, protocol.InvalidPacketNumber, p.Size(), logging.PacketDropDOSPrevention)
+	}
+	p.buffer.Decrement()
+	p.buffer.MaybeRelease()
 }
 
 func (s *connection) handleConnectionCloseFrame(frame *wire.ConnectionCloseFrame) error {
@@ -1784,8 +1807,10 @@ func (s *connection) handleAckFrame(frame *wire.AckFrame, encLevel protocol.Encr
 	}
 	// If one of the acknowledged packets was a Path MTU probe packet, this might have increased the Path MTU estimate.
 	if s.mtuDiscoverer != nil {
-		if mtu := s.mtuDiscoverer.CurrentSize(); mtu > protocol.ByteCount(s.currentMTUEstimate.Load()) {
-			s.currentMTUEstimate.Store(uint32(mtu))
+		mtu := s.mtuDiscoverer.CurrentSize()
+		maxPayloadSize := estimateMaxPayloadSize(mtu)
+		if maxPayloadSize > protocol.ByteCount(s.maxPayloadSizeEstimate.Load()) {
+			s.maxPayloadSizeEstimate.Store(uint32(maxPayloadSize))
 			s.sentPacketHandler.SetMaxDatagramSize(mtu)
 		}
 	}
@@ -2207,11 +2232,18 @@ func (s *connection) sendPacketsWithoutGSO(now time.Time) error {
 func (s *connection) sendPacketsWithGSO(now time.Time) error {
 	buf := getLargePacketBuffer()
 	maxSize := s.maxPacketSize()
+	// All segments of a batch have the size of the first packet. Only the last segment can be smaller.
+	var segSize protocol.ByteCount
+	var numSegments int
 
 	ecn := s.sentPacketHandler.ECNMode(true)
 	for {
 		var dontSendMore bool
-		size, err := s.appendOneShortHeaderPacket(buf, maxSize, ecn, now)
+		packSize := maxSize
+		if segSize > 0 {
+			packSize = segSize
+		}
+		size, err := s.appendOneShortHeaderPacket(buf, packSize, ecn, now)
 		if err != nil {
 			if err != errNothingToPack {
 				return err
@@ -2221,6 +2253,11 @@ func (s *connection) sendPacketsWithGSO(now time.Time) error {
 				return nil
 			}
 			dontSendMore = true
+		} else {
+			numSegments++
+			if segSize == 0 {
+				segSize = size
+			}
 		}
 
 		if !dontSendMore {
@@ -2238,14 +2275,17 @@ func (s *connection) sendPacketsWithGSO(now time.Time) error {
 
 		// Append another packet if
 		// 1. The congestion controller and pacer allow sending more
-		// 2. The last packet appended was a full-size packet
+		// 2. The last packet appended has the segment size
 		// 3. The next packet will have the same ECN marking
 		// 4. We still have enough space for another full-size packet in the buffer
-		if !dontSendMore && size == maxSize && nextECN == ecn && buf.Len()+maxSize <= buf.Cap() {
+		// 5. The batch has fewer than the maximum number of segments
+		// 6. The segments have the maximum size, or the next DATAGRAM fits into a segment
+		if !dontSendMore && size == segSize && nextECN == ecn && buf.Len()+maxSize <= buf.Cap() &&
+			numSegments < maxGSOSegments && (segSize == maxSize || s.nextDatagramFits(segSize)) {
 			continue
 		}
 
-		s.sendQueue.Send(buf, uint16(maxSize), ecn)
+		s.sendQueue.Send(buf, uint16(segSize), ecn)
 
 		if dontSendMore {
 			return nil
@@ -2265,7 +2305,23 @@ func (s *connection) sendPacketsWithGSO(now time.Time) error {
 
 		ecn = nextECN
 		buf = getLargePacketBuffer()
+		segSize, numSegments = 0, 0
 	}
+}
+
+// maxGSOSegments is the max number of segments in one GSO batch. Older Linux kernels do not accept more.
+const maxGSOSegments = 64
+
+// nextDatagramFits reports if the next queued DATAGRAM frame fits into a 1-RTT packet of size bytes.
+// If it does not fit, the packer must not get this size, because it drops the frame.
+func (s *connection) nextDatagramFits(size protocol.ByteCount) bool {
+	f := s.datagramQueue.Peek()
+	if f == nil {
+		return false
+	}
+	_, pnLen := s.sentPacketHandler.PeekPacketNumber(protocol.Encryption1RTT)
+	hdrLen := wire.ShortHeaderLen(s.connIDManager.Get(), pnLen)
+	return f.Length(s.version) <= size-hdrLen-16 /* tag size */
 }
 
 func (s *connection) resetPacingDeadline() {
@@ -2601,7 +2657,7 @@ func (s *connection) SendDatagram(p []byte) error {
 	// Under many circumstances we could send a few more bytes.
 	maxDataLen := min(
 		f.MaxDataLen(s.peerParams.MaxDatagramFrameSize, s.version),
-		protocol.ByteCount(s.currentMTUEstimate.Load()),
+		protocol.ByteCount(s.maxPayloadSizeEstimate.Load()),
 	)
 	if protocol.ByteCount(len(p)) > maxDataLen {
 		return &DatagramTooLargeError{MaxDatagramPayloadSize: int64(maxDataLen)}

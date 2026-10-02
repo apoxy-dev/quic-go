@@ -46,7 +46,14 @@ const DefaultMaxIncomingUniStreams = 100
 const MaxServerUnprocessedPackets = 1024
 
 // MaxConnUnprocessedPackets is the max number of packets stored in each connection that are not yet processed.
-const MaxConnUnprocessedPackets = 256
+const MaxConnUnprocessedPackets = 16384
+
+// MaxQueuedPacketAge is the longest time that a packet can wait in the connection queue.
+// After the handshake, the connection drops older packets.
+const MaxQueuedPacketAge = 10 * time.Millisecond
+
+// MaxPacketsPerWakeup is the max number of queued packets that the connection handles before it sends.
+const MaxPacketsPerWakeup = 256
 
 // SkipPacketInitialPeriod is the initial period length used for packet number skipping to prevent an Optimistic ACK attack.
 // Every time a packet number is skipped, the period is doubled, up to SkipPacketMaxPeriod.

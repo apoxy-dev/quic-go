@@ -7,21 +7,19 @@ import (
 	"github.com/quic-go/quic-go/quicvarint"
 )
 
-// MaxDatagramSize is the maximum size of a DATAGRAM frame (RFC 9221).
-// By setting it to a large value, we allow all datagrams that fit into a QUIC packet.
-// The value is chosen such that it can still be encoded as a 2 byte varint.
-// This is a var and not a const so it can be set in tests.
+// MaxDatagramSize is the max size of a DATAGRAM frame (RFC 9221) that fits into a 2 byte varint.
+// It is a variable so that tests can change it.
 var MaxDatagramSize protocol.ByteCount = 16383
 
-// A DatagramFrame is a DATAGRAM frame
+// DatagramFrame carries one unreliable datagram (RFC 9221).
 type DatagramFrame struct {
 	DataLenPresent bool
 	Data           []byte
 }
 
-func parseDatagramFrame(b []byte, typ uint64, _ protocol.Version) (*DatagramFrame, int, error) {
+// parseDatagramFrame parses a DATAGRAM frame into f. f.Data is a slice of b.
+func parseDatagramFrame(f *DatagramFrame, b []byte, typ uint64, _ protocol.Version) (int, error) {
 	startLen := len(b)
-	f := &DatagramFrame{}
 	f.DataLenPresent = typ&0x1 > 0
 
 	var length uint64
@@ -30,18 +28,17 @@ func parseDatagramFrame(b []byte, typ uint64, _ protocol.Version) (*DatagramFram
 		var l int
 		length, l, err = quicvarint.Parse(b)
 		if err != nil {
-			return nil, 0, replaceUnexpectedEOF(err)
+			return 0, replaceUnexpectedEOF(err)
 		}
 		b = b[l:]
 		if length > uint64(len(b)) {
-			return nil, 0, io.EOF
+			return 0, io.EOF
 		}
 	} else {
 		length = uint64(len(b))
 	}
-	f.Data = make([]byte, length)
-	copy(f.Data, b)
-	return f, startLen - len(b) + int(length), nil
+	f.Data = b[:length]
+	return startLen - len(b) + int(length), nil
 }
 
 func (f *DatagramFrame) Append(b []byte, _ protocol.Version) ([]byte, error) {
@@ -57,12 +54,11 @@ func (f *DatagramFrame) Append(b []byte, _ protocol.Version) ([]byte, error) {
 	return b, nil
 }
 
-// MaxDataLen returns the maximum data length
+// MaxDataLen returns the max data length of a frame that has maxSize bytes.
 func (f *DatagramFrame) MaxDataLen(maxSize protocol.ByteCount, version protocol.Version) protocol.ByteCount {
 	headerLen := protocol.ByteCount(1)
 	if f.DataLenPresent {
-		// pretend that the data size will be 1 bytes
-		// if it turns out that varint encoding the length will consume 2 bytes, we need to adjust the data length afterwards
+		// Start with a 1 byte length. Below, remove 1 byte if the length needs 2 bytes.
 		headerLen++
 	}
 	if headerLen > maxSize {
@@ -75,7 +71,7 @@ func (f *DatagramFrame) MaxDataLen(maxSize protocol.ByteCount, version protocol.
 	return maxDataLen
 }
 
-// Length of a written frame
+// Length returns the number of bytes of the encoded frame.
 func (f *DatagramFrame) Length(_ protocol.Version) protocol.ByteCount {
 	length := 1 + protocol.ByteCount(len(f.Data))
 	if f.DataLenPresent {
