@@ -19,9 +19,10 @@ type FrameParser struct {
 	supportsResetStreamAt bool
 	supportsAckFrequency  bool
 
-	// To avoid allocating when parsing, keep a single ACK frame struct.
-	// It is used over and over again.
-	ackFrame *AckFrame
+	// The parser uses the same ACK and DATAGRAM frames again, so that it does not allocate.
+	// The DATAGRAM data is a slice of the packet.
+	ackFrame      *AckFrame
+	datagramFrame *DatagramFrame
 }
 
 // NewFrameParser creates a new frame parser.
@@ -31,6 +32,7 @@ func NewFrameParser(supportsDatagrams, supportsResetStreamAt, supportsAckFrequen
 		supportsResetStreamAt: supportsResetStreamAt,
 		supportsAckFrequency:  supportsAckFrequency,
 		ackFrame:              &AckFrame{},
+		datagramFrame:         &DatagramFrame{},
 	}
 }
 
@@ -48,7 +50,7 @@ func (p *FrameParser) ParseType(b []byte, encLevel protocol.EncryptionLevel) (Fr
 			}
 		}
 		b = b[l:]
-		if typ == 0x0 { // skip PADDING frames
+		if typ == 0x0 { // Skip PADDING frames.
 			continue
 		}
 		ft := FrameType(typ)
@@ -105,8 +107,9 @@ func (p *FrameParser) ParseAckFrame(frameType FrameType, data []byte, encLevel p
 	return p.ackFrame, l, nil
 }
 
+// ParseDatagramFrame parses a DATAGRAM frame. The frame is valid until the next call, and its data is a slice of data.
 func (p *FrameParser) ParseDatagramFrame(frameType FrameType, data []byte, v protocol.Version) (*DatagramFrame, int, error) {
-	f, l, err := parseDatagramFrame(data, frameType, v)
+	l, err := parseDatagramFrame(p.datagramFrame, data, frameType, v)
 	if err != nil {
 		return nil, 0, &qerr.TransportError{
 			ErrorCode:    qerr.FrameEncodingError,
@@ -114,7 +117,7 @@ func (p *FrameParser) ParseDatagramFrame(frameType FrameType, data []byte, v pro
 			ErrorMessage: err.Error(),
 		}
 	}
-	return f, l, nil
+	return p.datagramFrame, l, nil
 }
 
 // ParseLessCommonFrame parses everything except STREAM, ACK or DATAGRAM.
@@ -178,8 +181,7 @@ func (p *FrameParser) ParseLessCommonFrame(frameType FrameType, data []byte, v p
 	return frame, l, err
 }
 
-// SetAckDelayExponent sets the acknowledgment delay exponent (sent in the transport parameters).
-// This value is used to scale the ACK Delay field in the ACK frame.
+// SetAckDelayExponent sets the exponent from the transport parameters that scales the ACK Delay field.
 func (p *FrameParser) SetAckDelayExponent(exp uint8) {
 	p.ackDelayExponent = exp
 }

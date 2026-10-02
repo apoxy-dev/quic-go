@@ -175,10 +175,8 @@ type Config struct {
 	// Enable QUIC Stream Resets with Partial Delivery.
 	// See https://datatracker.ietf.org/doc/html/draft-ietf-quic-reliable-stream-reset-07.
 	EnableStreamResetPartialDelivery bool
-	// DisableCongestionControl replaces the default Cubic congestion controller
-	// with a no-op that always allows sending. Use this when an inner transport
-	// (e.g. netstack TCP) already handles congestion control and QUIC CC would
-	// be redundant.
+	// DisableCongestionControl replaces the Cubic congestion controller with one that always allows sending.
+	// Use it when an inner transport, for example TCP in a netstack, already controls congestion.
 	DisableCongestionControl bool
 
 	Tracer func(ctx context.Context, isClient bool, connID ConnectionID) qlogwriter.Trace
@@ -217,4 +215,10 @@ type ConnectionState struct {
 	Version Version
 	// GSO says if generic segmentation offload is used.
 	GSO bool
+	// QueueFullDrops is the number of received packets that the connection dropped because its queue was full.
+	QueueFullDrops uint64
+	// QueueAgeDrops is the number of received packets that the connection dropped because they waited too long in its queue.
+	QueueAgeDrops uint64
+	// DatagramQueueDrops is the number of received datagrams that the connection dropped because the application did not read them in time.
+	DatagramQueueDrops uint64
 }

@@ -165,7 +165,7 @@ type Conn struct {
 	packer        packer
 	mtuDiscoverer mtuDiscoverer // initialized when the transport parameters are received
 
-	currentMTUEstimate atomic.Uint32
+	maxPayloadSizeEstimate atomic.Uint32
 
 	initialStream       *initialCryptoStream
 	handshakeStream     *cryptoStream
@@ -176,6 +176,8 @@ type Conn struct {
 	sendingScheduled     chan struct{}
 	receivedPacketMx     sync.Mutex
 	receivedPackets      ringbuffer.RingBuffer[receivedPacket]
+	queueFullDrops       atomic.Uint64
+	queueAgeDrops        atomic.Uint64
 
 	// closeChan is used to notify the run loop that it should terminate
 	closeChan chan struct{}
@@ -323,7 +325,7 @@ var newConnection = func(
 		s.qlogger,
 		s.logger,
 	)
-	s.currentMTUEstimate.Store(uint32(estimateMaxPayloadSize(protocol.ByteCount(s.config.InitialPacketSize))))
+	s.maxPayloadSizeEstimate.Store(uint32(estimateMaxPayloadSize(protocol.ByteCount(s.config.InitialPacketSize))))
 	statelessResetToken := statelessResetter.GetStatelessResetToken(srcConnID)
 	params := &wire.TransportParameters{
 		InitialMaxStreamDataBidiLocal:   protocol.ByteCount(s.config.InitialStreamReceiveWindow),
@@ -453,7 +455,7 @@ var newClientConnection = func(
 		s.qlogger,
 		s.logger,
 	)
-	s.currentMTUEstimate.Store(uint32(estimateMaxPayloadSize(protocol.ByteCount(s.config.InitialPacketSize))))
+	s.maxPayloadSizeEstimate.Store(uint32(estimateMaxPayloadSize(protocol.ByteCount(s.config.InitialPacketSize))))
 	oneRTTStream := newCryptoStream()
 	params := &wire.TransportParameters{
 		InitialMaxStreamDataBidiRemote: protocol.ByteCount(s.config.InitialStreamReceiveWindow),
@@ -787,6 +789,9 @@ func (c *Conn) ConnectionState() ConnectionState {
 	c.connState.SupportsDatagrams.Local = c.config.EnableDatagrams
 	c.connState.SupportsStreamResetPartialDelivery.Local = c.config.EnableStreamResetPartialDelivery
 	c.connState.GSO = c.conn.capabilities().GSO
+	c.connState.QueueFullDrops = c.queueFullDrops.Load()
+	c.connState.QueueAgeDrops = c.queueAgeDrops.Load()
+	c.connState.DatagramQueueDrops = c.datagramQueue.rcvDrops.Load()
 	return c.connState
 }
 
@@ -1000,11 +1005,9 @@ func (c *Conn) handleHandshakeConfirmed(now monotime.Time) error {
 	return nil
 }
 
-const maxPacketsToProcess = 32
-
 func (c *Conn) handlePackets() (wasProcessed bool, _ error) {
 	// Process packets from the receivedPackets queue.
-	// Limit the number of packets to process to maxPacketsToProcess,
+	// Limit the number of packets to process to protocol.MaxPacketsPerWakeup,
 	// so we eventually get a chance to send out an ACK when receiving a lot of packets.
 	c.receivedPacketMx.Lock()
 
@@ -1012,22 +1015,31 @@ func (c *Conn) handlePackets() (wasProcessed bool, _ error) {
 		c.receivedPacketMx.Unlock()
 		return false, nil
 	}
+	// After the handshake, drop the packets that waited too long in the queue.
+	// A monotime.Time can be negative, so the zero value cannot mean "no limit".
+	dropOld := c.handshakeComplete
+	oldest := monotime.Now().Add(-protocol.MaxQueuedPacketAge)
 
 	var hasMorePackets bool
-	for range maxPacketsToProcess {
+	for range protocol.MaxPacketsPerWakeup {
 		p := c.receivedPackets.PopFront()
 		c.receivedPacketMx.Unlock()
 
-		var datagramID qlog.DatagramID
-		if c.qlogger != nil && wire.IsLongHeaderPacket(p.data[0]) {
-			datagramID = qlog.CalculateDatagramID(p.data)
-		}
-		processed, err := c.handleOnePacket(p, datagramID)
-		if err != nil {
-			return false, err
-		}
-		if processed {
-			wasProcessed = true
+		if dropOld && p.rcvTime.Before(oldest) {
+			c.queueAgeDrops.Add(1)
+			c.dropQueuedPacket(p)
+		} else {
+			var datagramID qlog.DatagramID
+			if c.qlogger != nil && wire.IsLongHeaderPacket(p.data[0]) {
+				datagramID = qlog.CalculateDatagramID(p.data)
+			}
+			processed, err := c.handleOnePacket(p, datagramID)
+			if err != nil {
+				return false, err
+			}
+			if processed {
+				wasProcessed = true
+			}
 		}
 		c.receivedPacketMx.Lock()
 		hasMorePackets = !c.receivedPackets.Empty()
@@ -1957,18 +1969,9 @@ func (c *Conn) handlePacket(p receivedPacket) {
 	// Discard packets once the amount of queued packets is larger than
 	// the channel size, protocol.MaxConnUnprocessedPackets
 	if c.receivedPackets.Len() >= protocol.MaxConnUnprocessedPackets {
-		if c.qlogger != nil {
-			var datagramID qlog.DatagramID
-			if wire.IsLongHeaderPacket(p.data[0]) {
-				datagramID = qlog.CalculateDatagramID(p.data)
-			}
-			c.qlogger.RecordEvent(qlog.PacketDropped{
-				Raw:        qlog.RawInfo{Length: int(p.Size())},
-				DatagramID: datagramID,
-				Trigger:    qlog.PacketDropDOSPrevention,
-			})
-		}
 		c.receivedPacketMx.Unlock()
+		c.queueFullDrops.Add(1)
+		c.dropQueuedPacket(p)
 		return
 	}
 	c.receivedPackets.PushBack(p)
@@ -1978,6 +1981,23 @@ func (c *Conn) handlePacket(p receivedPacket) {
 	case c.notifyReceivedPacket <- struct{}{}:
 	default:
 	}
+}
+
+// dropQueuedPacket drops a packet that the connection did not process, and releases its buffer.
+func (c *Conn) dropQueuedPacket(p receivedPacket) {
+	if c.qlogger != nil {
+		var datagramID qlog.DatagramID
+		if wire.IsLongHeaderPacket(p.data[0]) {
+			datagramID = qlog.CalculateDatagramID(p.data)
+		}
+		c.qlogger.RecordEvent(qlog.PacketDropped{
+			Raw:        qlog.RawInfo{Length: int(p.Size())},
+			DatagramID: datagramID,
+			Trigger:    qlog.PacketDropDOSPrevention,
+		})
+	}
+	p.buffer.Decrement()
+	p.buffer.MaybeRelease()
 }
 
 func (c *Conn) handleConnectionCloseFrame(frame *wire.ConnectionCloseFrame) error {
@@ -2130,8 +2150,10 @@ func (c *Conn) handleAckFrame(frame *wire.AckFrame, encLevel protocol.Encryption
 	}
 	// If one of the acknowledged packets was a Path MTU probe packet, this might have increased the Path MTU estimate.
 	if c.mtuDiscoverer != nil {
-		if mtu := c.mtuDiscoverer.CurrentSize(); mtu > protocol.ByteCount(c.currentMTUEstimate.Load()) {
-			c.currentMTUEstimate.Store(uint32(mtu))
+		mtu := c.mtuDiscoverer.CurrentSize()
+		maxPayloadSize := estimateMaxPayloadSize(mtu)
+		if maxPayloadSize > protocol.ByteCount(c.maxPayloadSizeEstimate.Load()) {
+			c.maxPayloadSizeEstimate.Store(uint32(maxPayloadSize))
 			c.sentPacketHandler.SetMaxDatagramSize(mtu)
 		}
 	}
@@ -2596,11 +2618,18 @@ func (c *Conn) sendPacketsWithoutGSO(now monotime.Time) error {
 func (c *Conn) sendPacketsWithGSO(now monotime.Time) error {
 	buf := getLargePacketBuffer()
 	maxSize := c.maxPacketSize()
+	// All segments of a batch have the size of the first packet. Only the last segment can be smaller.
+	var segSize protocol.ByteCount
+	var numSegments int
 
 	ecn := c.sentPacketHandler.ECNMode(true)
 	for {
 		var dontSendMore bool
-		size, err := c.appendOneShortHeaderPacket(buf, maxSize, ecn, now)
+		packSize := maxSize
+		if segSize > 0 {
+			packSize = segSize
+		}
+		size, err := c.appendOneShortHeaderPacket(buf, packSize, ecn, now)
 		if err != nil {
 			if err != errNothingToPack {
 				return err
@@ -2610,6 +2639,11 @@ func (c *Conn) sendPacketsWithGSO(now monotime.Time) error {
 				return nil
 			}
 			dontSendMore = true
+		} else {
+			numSegments++
+			if segSize == 0 {
+				segSize = size
+			}
 		}
 
 		if !dontSendMore {
@@ -2627,14 +2661,17 @@ func (c *Conn) sendPacketsWithGSO(now monotime.Time) error {
 
 		// Append another packet if
 		// 1. The congestion controller and pacer allow sending more
-		// 2. The last packet appended was a full-size packet
+		// 2. The last packet appended has the segment size
 		// 3. The next packet will have the same ECN marking
 		// 4. We still have enough space for another full-size packet in the buffer
-		if !dontSendMore && size == maxSize && nextECN == ecn && buf.Len()+maxSize <= buf.Cap() {
+		// 5. The batch has fewer than the maximum number of segments
+		// 6. The segments have the maximum size, or the next DATAGRAM fits into a segment
+		if !dontSendMore && size == segSize && nextECN == ecn && buf.Len()+maxSize <= buf.Cap() &&
+			numSegments < maxGSOSegments && (segSize == maxSize || c.nextDatagramFits(segSize)) {
 			continue
 		}
 
-		c.sendQueue.Send(buf, uint16(maxSize), ecn)
+		c.sendQueue.Send(buf, uint16(segSize), ecn)
 
 		if dontSendMore {
 			return nil
@@ -2654,7 +2691,23 @@ func (c *Conn) sendPacketsWithGSO(now monotime.Time) error {
 
 		ecn = nextECN
 		buf = getLargePacketBuffer()
+		segSize, numSegments = 0, 0
 	}
+}
+
+// maxGSOSegments is the max number of segments in one GSO batch. Older Linux kernels do not accept more.
+const maxGSOSegments = 64
+
+// nextDatagramFits reports if the next queued DATAGRAM frame fits into a 1-RTT packet of size bytes.
+// If it does not fit, the packer must not get this size, because it drops the frame.
+func (c *Conn) nextDatagramFits(size protocol.ByteCount) bool {
+	f := c.datagramQueue.Peek()
+	if f == nil {
+		return false
+	}
+	_, pnLen := c.sentPacketHandler.PeekPacketNumber(protocol.Encryption1RTT)
+	hdrLen := wire.ShortHeaderLen(c.connIDManager.Get(), pnLen)
+	return f.Length(c.version) <= size-hdrLen-16 /* tag size */
 }
 
 func (c *Conn) resetPacingDeadline() {
@@ -3033,7 +3086,7 @@ func (c *Conn) SendDatagram(p []byte) error {
 	// Under many circumstances we could send a few more bytes.
 	maxDataLen := min(
 		f.MaxDataLen(c.peerParams.MaxDatagramFrameSize, c.version),
-		protocol.ByteCount(c.currentMTUEstimate.Load()),
+		protocol.ByteCount(c.maxPayloadSizeEstimate.Load()),
 	)
 	if protocol.ByteCount(len(p)) > maxDataLen {
 		return &DatagramTooLargeError{MaxDatagramPayloadSize: int64(maxDataLen)}

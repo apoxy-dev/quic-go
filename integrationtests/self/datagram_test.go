@@ -3,6 +3,8 @@ package self_test
 import (
 	"bytes"
 	"context"
+	"fmt"
+	"io"
 	mrand "math/rand/v2"
 	"net"
 	"sync/atomic"
@@ -10,8 +12,11 @@ import (
 	"time"
 
 	"github.com/quic-go/quic-go"
+	"github.com/quic-go/quic-go/internal/protocol"
 	"github.com/quic-go/quic-go/internal/synctest"
 	"github.com/quic-go/quic-go/internal/wire"
+	"github.com/quic-go/quic-go/qlog"
+	"github.com/quic-go/quic-go/testutils/events"
 	"github.com/quic-go/quic-go/testutils/simnet"
 
 	"github.com/stretchr/testify/assert"
@@ -125,6 +130,225 @@ func TestDatagramSizeLimit(t *testing.T) {
 	datagram, err := serverConn.ReceiveDatagram(ctx)
 	require.NoError(t, err)
 	require.Equal(t, bytes.Repeat([]byte("b"), int(sizeErr.MaxDatagramPayloadSize)), datagram)
+}
+
+func TestDatagramSizeLimitWithMTUDiscovery(t *testing.T) {
+	server, err := quic.Listen(
+		newUDPConnLocalhost(t),
+		getTLSConfig(),
+		getQuicConfig(&quic.Config{EnableDatagrams: true}),
+	)
+	require.NoError(t, err)
+	defer server.Close()
+
+	var eventRecorder events.Recorder
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	clientConn, err := quic.Dial(
+		ctx,
+		newUDPConnLocalhost(t),
+		server.Addr(),
+		getTLSClientConfig(),
+		getQuicConfig(&quic.Config{
+			InitialPacketSize: protocol.MinInitialPacketSize,
+			EnableDatagrams:   true,
+			Tracer:            newTracer(&eventRecorder),
+		}),
+	)
+	require.NoError(t, err)
+	defer clientConn.CloseWithError(0, "")
+
+	serverConn, err := server.Accept(ctx)
+	require.NoError(t, err)
+	defer serverConn.CloseWithError(0, "")
+
+	serverErrChan := make(chan error, 1)
+	go func() {
+		str, err := serverConn.AcceptStream(ctx)
+		if err != nil {
+			serverErrChan <- err
+			return
+		}
+		_, err = io.Copy(io.Discard, str)
+		serverErrChan <- err
+	}()
+
+	str, err := clientConn.OpenStream()
+	require.NoError(t, err)
+
+	data := bytes.Repeat([]byte("d"), 16*1024)
+	var discoveredMTU int
+	var checkedMTUUpdates int
+	var previousMaxPayloadSize int64
+	for discoveredMTU == 0 {
+		_, err = str.Write(data)
+		require.NoError(t, err)
+		updates := eventRecorder.Events(qlog.MTUUpdated{})
+		for ; checkedMTUUpdates < len(updates); checkedMTUUpdates++ {
+			update := updates[checkedMTUUpdates].(qlog.MTUUpdated)
+			err = clientConn.SendDatagram(bytes.Repeat([]byte("x"), 2000))
+			var sizeErr *quic.DatagramTooLargeError
+			require.ErrorAs(t, err, &sizeErr)
+			maxPayloadSize := sizeErr.MaxDatagramPayloadSize
+			require.Greater(t, maxPayloadSize, int64(0))
+			require.GreaterOrEqual(t, maxPayloadSize, previousMaxPayloadSize)
+			require.Less(t, maxPayloadSize, int64(update.Value))
+			previousMaxPayloadSize = maxPayloadSize
+
+			datagramData := bytes.Repeat([]byte("z"), int(maxPayloadSize))
+			err = clientConn.SendDatagram(datagramData)
+			require.NoError(t, err)
+
+			datagram, err := serverConn.ReceiveDatagram(ctx)
+			require.NoError(t, err, "datagram should be deliverable when respecting MaxDatagramPayloadSize")
+			require.Equal(t, datagramData, datagram)
+
+			if update.Done {
+				discoveredMTU = update.Value
+			}
+		}
+		require.NoError(t, ctx.Err())
+	}
+	require.NoError(t, str.Close())
+
+	select {
+	case err := <-serverErrChan:
+		require.NoError(t, err)
+	case <-ctx.Done():
+		require.NoError(t, ctx.Err())
+	}
+}
+
+// Near the packet size, SendDatagram must refuse each datagram that the packer cannot send.
+func TestDatagramSizeNearInitialPacketSize(t *testing.T) {
+	tests := []struct {
+		ips       uint16
+		connIDLen int
+	}{
+		{ips: 1280, connIDLen: 4},
+		{ips: 1321, connIDLen: 4},
+		{ips: 1350, connIDLen: 4},
+		{ips: 1350, connIDLen: 8},
+	}
+	for _, test := range tests {
+		t.Run(fmt.Sprintf("size %d, connection ID %d", test.ips, test.connIDLen), func(t *testing.T) {
+			conf := getQuicConfig(&quic.Config{
+				EnableDatagrams:         true,
+				InitialPacketSize:       test.ips,
+				DisablePathMTUDiscovery: true,
+			})
+			serverTr := &quic.Transport{Conn: newUDPConnLocalhost(t), ConnectionIDLength: test.connIDLen}
+			defer serverTr.Close()
+			addTracer(serverTr)
+			server, err := serverTr.Listen(getTLSConfig(), conf)
+			require.NoError(t, err)
+			defer server.Close()
+
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			clientTr := &quic.Transport{Conn: newUDPConnLocalhost(t), ConnectionIDLength: test.connIDLen}
+			defer clientTr.Close()
+			addTracer(clientTr)
+			clientConn, err := clientTr.Dial(ctx, server.Addr(), getTLSClientConfig(), conf)
+			require.NoError(t, err)
+			defer clientConn.CloseWithError(0, "")
+			serverConn, err := server.Accept(ctx)
+			require.NoError(t, err)
+			defer serverConn.CloseWithError(0, "")
+
+			// After a stream round trip, both sides have handled ACK frames.
+			go func() {
+				str, err := serverConn.AcceptStream(ctx)
+				if err != nil {
+					return
+				}
+				io.Copy(str, str)
+				str.Close()
+			}()
+			str, err := clientConn.OpenStreamSync(ctx)
+			require.NoError(t, err)
+			_, err = str.Write([]byte("ping"))
+			require.NoError(t, err)
+			require.NoError(t, str.Close())
+			data, err := io.ReadAll(str)
+			require.NoError(t, err)
+			require.Equal(t, []byte("ping"), data)
+
+			t.Run("client", func(t *testing.T) { testDatagramSizes(t, clientConn, serverConn, int(test.ips)) })
+			t.Run("server", func(t *testing.T) { testDatagramSizes(t, serverConn, clientConn, int(test.ips)) })
+		})
+	}
+}
+
+// testDatagramSizes sends one datagram of each size from ips-40 to ips. Each datagram that SendDatagram accepts must arrive.
+func testDatagramSizes(t *testing.T, sender, receiver *quic.Conn, ips int) {
+	var accepted int
+	for size := ips - 40; size <= ips; size++ {
+		data := bytes.Repeat([]byte{byte(size)}, size)
+		if err := sender.SendDatagram(data); err != nil {
+			var sizeErr *quic.DatagramTooLargeError
+			require.ErrorAs(t, err, &sizeErr)
+			continue
+		}
+		accepted++
+		ctx, cancel := context.WithTimeout(context.Background(), scaleDuration(time.Second))
+		got, err := receiver.ReceiveDatagram(ctx)
+		cancel()
+		require.NoError(t, err, "a datagram of %d bytes was accepted, but it did not arrive", size)
+		require.Equal(t, data, got)
+	}
+	require.NotZero(t, accepted)
+}
+
+// Datagrams of changing sizes go out in GSO batches. The sender must not drop any of them.
+func TestDatagramGSOMixedSizes(t *testing.T) {
+	server, err := quic.Listen(
+		newUDPConnLocalhost(t),
+		getTLSConfig(),
+		getQuicConfig(&quic.Config{EnableDatagrams: true}),
+	)
+	require.NoError(t, err)
+	defer server.Close()
+
+	var eventRecorder events.Recorder
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	clientConn, err := quic.Dial(
+		ctx,
+		newUDPConnLocalhost(t),
+		server.Addr(),
+		getTLSClientConfig(),
+		getQuicConfig(&quic.Config{
+			EnableDatagrams:          true,
+			DisableCongestionControl: true,
+			Tracer:                   newTracer(&eventRecorder),
+		}),
+	)
+	require.NoError(t, err)
+	defer clientConn.CloseWithError(0, "")
+	if !clientConn.ConnectionState().GSO {
+		t.Skip("GSO is not available")
+	}
+
+	// A small datagram before a large one starts a batch with small segments.
+	sizes := []int{100, 1100, 40, 1000, 1000, 300}
+	const num = 6000
+	for i := 0; i < num; i++ {
+		require.NoError(t, clientConn.SendDatagram(make([]byte, sizes[i%len(sizes)])))
+	}
+	sentDatagrams := func() int {
+		var n int
+		for _, ev := range eventRecorder.Events(qlog.PacketSent{}) {
+			for _, f := range ev.(qlog.PacketSent).Frames {
+				if _, ok := f.Frame.(*qlog.DatagramFrame); ok {
+					n++
+				}
+			}
+		}
+		return n
+	}
+	require.Eventually(t, func() bool { return sentDatagrams() >= num }, scaleDuration(time.Second), scaleDuration(10*time.Millisecond))
+	require.Equal(t, num, sentDatagrams())
 }
 
 func TestDatagramLoss(t *testing.T) {
