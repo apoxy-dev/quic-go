@@ -72,6 +72,7 @@ type oobConn struct {
 	// Packets received from the kernel, but not yet returned by ReadPacket().
 	messages []ipv4.Message
 	buffers  [batchSize]*packetBuffer
+	rcvTime  time.Time // All packets of one read get the time of the read.
 
 	cap connCapabilities
 }
@@ -181,6 +182,7 @@ func (c *oobConn) ReadPacket() (receivedPacket, error) {
 			return receivedPacket{}, err
 		}
 		c.messages = c.messages[:n]
+		c.rcvTime = time.Now()
 	}
 
 	msg := c.messages[c.readPos]
@@ -190,7 +192,7 @@ func (c *oobConn) ReadPacket() (receivedPacket, error) {
 	data := msg.OOB[:msg.NN]
 	p := receivedPacket{
 		remoteAddr: msg.Addr,
-		rcvTime:    time.Now(),
+		rcvTime:    c.rcvTime,
 		data:       msg.Buffers[0][:msg.N],
 		buffer:     buffer,
 	}
