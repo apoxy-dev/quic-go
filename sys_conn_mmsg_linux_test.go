@@ -274,8 +274,8 @@ func BenchmarkReadBatch(b *testing.B) {
 				}
 				payload := make([]byte, 1200)
 				dst := ln.LocalAddr()
-				// 8 batches of 1200 B packets fit in the default socket buffer.
-				const batches = 8
+				// 64 packets of 1200 B fit in the default socket buffer.
+				const batches = max(1, 64/batchSize)
 				var pkts int
 				b.ReportAllocs()
 				b.ResetTimer()

@@ -21,7 +21,9 @@ const (
 
 const ecnIPv4DataLen = 1
 
-const batchSize = 8 // needs to smaller than MaxUint8 (otherwise the type of oobConn.readPos has to be changed)
+// batchSize is the most packets of one recvmmsg call. It must be less than
+// MaxUint8, the limit of oobConn.readPos.
+const batchSize = 64
 
 var kernelVersionMajor int
 
