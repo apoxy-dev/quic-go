@@ -12,6 +12,7 @@ import (
 	"golang.org/x/net/ipv4"
 	"golang.org/x/sys/unix"
 
+	"github.com/quic-go/quic-go/internal/monotime"
 	"github.com/quic-go/quic-go/internal/protocol"
 
 	"github.com/stretchr/testify/require"
@@ -303,10 +304,18 @@ func TestReadsMultipleMessagesInOneBatch(t *testing.T) {
 	require.NoError(t, err)
 	oobConn.batchConn = bc
 
+	var readTime monotime.Time
 	for i := 0; i < batchSize+1; i++ {
+		before := monotime.Now()
 		p, err := oobConn.ReadPacket()
 		require.NoError(t, err)
 		require.Equal(t, fmt.Sprintf("message %d", i), string(p.data))
+		// All packets of one read have the time of that read.
+		if i%bc.numMsgRead == 0 {
+			require.False(t, p.rcvTime.Before(before))
+			readTime = p.rcvTime
+		}
+		require.Equal(t, readTime, p.rcvTime)
 	}
 	require.Equal(t, 2, bc.callCounter)
 }
