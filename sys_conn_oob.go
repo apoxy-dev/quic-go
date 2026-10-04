@@ -86,7 +86,7 @@ type oobConn struct {
 
 var _ rawConn = &oobConn{}
 
-func newConn(c OOBCapablePacketConn, supportsDF bool) (*oobConn, error) {
+func newConn(c OOBCapablePacketConn, supportsDF, gro bool) (*oobConn, error) {
 	rawConn, err := c.SyscallConn()
 	if err != nil {
 		return nil, err
@@ -146,7 +146,7 @@ func newConn(c OOBCapablePacketConn, supportsDF bool) (*oobConn, error) {
 	}
 
 	// With GRO, each message holds up to 64 KiB, so a read has fewer messages.
-	gro := isGROEnabled(rawConn)
+	gro = gro && isGROEnabled(rawConn)
 	batch := batchSize
 	if gro {
 		batch = groBatchSize

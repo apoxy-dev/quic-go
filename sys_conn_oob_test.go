@@ -26,7 +26,7 @@ func runSysConnServer(t *testing.T, network string, addr *net.UDPAddr) (*net.UDP
 	require.NoError(t, err)
 	t.Cleanup(func() { udpConn.Close() })
 
-	oobConn, err := newConn(udpConn, true)
+	oobConn, err := newConn(udpConn, true, false)
 	require.NoError(t, err)
 	require.True(t, oobConn.capabilities().DF)
 
@@ -308,7 +308,7 @@ func readBufferSize(c *oobConn) int {
 
 func TestReadsMultipleMessagesInOneBatch(t *testing.T) {
 	udpConn := newUDPConnLocalhost(t)
-	oobConn, err := newConn(udpConn, true)
+	oobConn, err := newConn(udpConn, true, false)
 	require.NoError(t, err)
 	batch := oobConn.batch
 	bc := &mockBatchConn{t: t, numMsgRead: batch/2 + 1, batch: batch, bufSize: readBufferSize(oobConn)}
@@ -370,7 +370,7 @@ func TestTransportNonQUICBatchEnd(t *testing.T) {
 		{
 			name: "batched reads",
 			conn: func(t *testing.T) (net.PacketConn, []int) {
-				c, err := newConn(newUDPConnLocalhost(t), true)
+				c, err := newConn(newUDPConnLocalhost(t), true, false)
 				require.NoError(t, err)
 				sizes := []int{c.batch, 1, c.batch/2 + 1}
 				c.batchConn = &batchReader{sizes: sizes}
@@ -414,7 +414,7 @@ func TestSysConnSendGSO(t *testing.T) {
 	udpConn, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 0})
 	require.NoError(t, err)
 	c := &oobRecordingConn{UDPConn: udpConn}
-	oobConn, err := newConn(c, true)
+	oobConn, err := newConn(c, true, false)
 	require.NoError(t, err)
 	require.True(t, oobConn.capabilities().GSO)
 
