@@ -12,11 +12,16 @@ import (
 const (
 	msgTypeIPTOS = unix.IP_RECVTOS
 	ipv4PKTINFO  = 0x7
+	// The kernel has no UDP GRO, so no control message has this type.
+	msgTypeUDPGRO = -1
 )
 
 const ecnIPv4DataLen = 1
 
 const batchSize = 8
+
+// groBatchSize is not used: the kernel has no UDP GRO.
+const groBatchSize = batchSize
 
 func parseIPv4PktInfo(body []byte) (ip netip.Addr, _ uint32, ok bool) {
 	// struct in_pktinfo {
@@ -29,5 +34,7 @@ func parseIPv4PktInfo(body []byte) (ip netip.Addr, _ uint32, ok bool) {
 }
 
 func isGSOEnabled(syscall.RawConn) bool { return false }
+
+func isGROEnabled(syscall.RawConn) bool { return false }
 
 func isECNEnabled() bool { return !isECNDisabledUsingEnv() }
