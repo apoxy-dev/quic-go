@@ -153,7 +153,7 @@ func TestMmsgConnReadsLikeXNet(t *testing.T) {
 			require.NoError(t, err)
 			defer ln.Close()
 			require.NoError(t, ln.SetReadDeadline(time.Now().Add(5*time.Second)))
-			oc, err := newConn(ln, true)
+			oc, err := newConn(ln, true, false)
 			require.NoError(t, err)
 			mc, ok := oc.batchConn.(*mmsgConn)
 			require.True(t, ok)
@@ -232,7 +232,7 @@ func TestMmsgConnErrors(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			ln := newUDPConnLocalhost(t)
-			oc, err := newConn(ln, true)
+			oc, err := newConn(ln, true, false)
 			require.NoError(t, err)
 			tc.setup(ln)
 			ms := make([]ipv4.Message, 1)
@@ -257,7 +257,7 @@ func BenchmarkReadBatch(b *testing.B) {
 			b.Run(fmt.Sprintf("reader=%s/senders=%d", reader, senders), func(b *testing.B) {
 				ln := newUDPConnLocalhost(b)
 				require.NoError(b, ln.SetReadDeadline(time.Now().Add(time.Minute)))
-				oc, err := newConn(ln, true)
+				oc, err := newConn(ln, true, false)
 				require.NoError(b, err)
 				bc := oc.batchConn
 				if reader == "x/net" {

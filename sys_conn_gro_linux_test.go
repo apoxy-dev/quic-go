@@ -5,6 +5,7 @@ package quic
 import (
 	"bytes"
 	"encoding/binary"
+	"fmt"
 	"net"
 	"net/netip"
 	"testing"
@@ -182,7 +183,7 @@ func TestOOBConnSplitsJoinedDatagrams(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			c, err := newConn(newUDPConnLocalhost(t), true)
+			c, err := newConn(newUDPConnLocalhost(t), true, false)
 			require.NoError(t, err)
 			c.cap.GRO = true
 			c.batchConn = &groReader{msgs: tc.msgs}
@@ -222,42 +223,96 @@ func TestOOBConnSplitsJoinedDatagrams(t *testing.T) {
 	}
 }
 
-// TestTransportGROReceive sends joined datagrams with GSO on loopback, and
-// checks that the handler gets each datagram.
-func TestTransportGROReceive(t *testing.T) {
-	ln := newUDPConnLocalhost(t)
-	c, err := newConn(ln, true)
+// udpGRO returns the UDP_GRO socket option of c.
+func udpGRO(t *testing.T, c *net.UDPConn) int {
+	t.Helper()
+	rc, err := c.SyscallConn()
 	require.NoError(t, err)
-	if !c.capabilities().GRO {
-		t.Skip("UDP GRO is not supported")
+	var v int
+	var serr error
+	require.NoError(t, rc.Control(func(fd uintptr) {
+		v, serr = unix.GetsockoptInt(int(fd), unix.IPPROTO_UDP, unix.UDP_GRO)
+	}))
+	if serr != nil {
+		t.Skipf("UDP_GRO is not supported: %v", serr)
 	}
-	got := make(chan []byte, 64)
-	ends := make(chan struct{}, 64)
-	tr := &Transport{
-		Conn:                 c,
-		NonQUICPacketHandler: func(b []byte, _ net.Addr) { got <- bytes.Clone(b) },
-		NonQUICBatchEnd:      func() { ends <- struct{}{} },
-	}
-	require.NoError(t, tr.Start())
-	defer tr.Close()
+	return v
+}
 
-	sender := newUDPConnLocalhost(t)
-	payload := append(append(bytes.Repeat([]byte{0x04}, 500), bytes.Repeat([]byte{0x05}, 500)...), bytes.Repeat([]byte{0x06}, 300)...)
-	_, _, err = sender.WriteMsgUDP(payload, appendUDPSegmentSizeMsg(nil, 500), ln.LocalAddr().(*net.UDPAddr))
-	require.NoError(t, err)
-	for _, want := range [][]byte{payload[:500], payload[500:1000], payload[1000:]} {
-		select {
-		case b := <-got:
-			require.Equal(t, want, b)
-		case <-time.After(time.Second):
-			t.Fatal("timeout waiting for a datagram")
-		}
+// TestOOBConnGRO checks that only a conn with the opt-in sets UDP_GRO and reads into the large
+// buffers.
+func TestOOBConnGRO(t *testing.T) {
+	cases := []struct {
+		name    string
+		gro     bool
+		env     bool // QUIC_GO_DISABLE_GRO=true
+		want    int  // The UDP_GRO socket option.
+		bufSize int
+	}{
+		{name: "off", bufSize: protocol.MaxPacketBufferSize},
+		{name: "on", gro: true, want: 1, bufSize: protocol.MaxGROPacketBufferSize},
+		{name: "off by env", gro: true, env: true, bufSize: protocol.MaxPacketBufferSize},
 	}
-	select {
-	case <-ends:
-	case <-time.After(time.Second):
-		t.Fatal("timeout waiting for the batch end")
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if tc.env {
+				t.Setenv("QUIC_GO_DISABLE_GRO", "true")
+			}
+			ln := newUDPConnLocalhost(t)
+			c, err := newConn(ln, true, tc.gro)
+			require.NoError(t, err)
+			if tc.gro && !tc.env && !c.capabilities().GRO {
+				t.Skip("UDP GRO is not supported")
+			}
+			require.Equal(t, tc.want == 1, c.capabilities().GRO)
+			require.Equal(t, tc.want, udpGRO(t, ln))
+			b := c.getReadBuffer()
+			require.EqualValues(t, tc.bufSize, b.Cap())
+			b.Release()
+		})
 	}
-	require.Empty(t, got)
-	require.Empty(t, ends)
+}
+
+// TestTransportGRO starts a Transport with and without EnableGRO, sends one GSO datagram of three
+// segments on loopback, and checks the socket option and that the handler gets each datagram.
+func TestTransportGRO(t *testing.T) {
+	for _, gro := range []bool{false, true} {
+		t.Run(fmt.Sprintf("EnableGRO=%t", gro), func(t *testing.T) {
+			ln := newUDPConnLocalhost(t)
+			got := make(chan []byte, 64)
+			ends := make(chan struct{}, 64)
+			tr := &Transport{
+				Conn:                 ln,
+				EnableGRO:            gro,
+				NonQUICPacketHandler: func(b []byte, _ net.Addr) { got <- bytes.Clone(b) },
+				NonQUICBatchEnd:      func() { ends <- struct{}{} },
+			}
+			require.NoError(t, tr.Start())
+			defer tr.Close()
+			want := 0
+			if gro {
+				want = 1
+			}
+			require.Equal(t, want, udpGRO(t, ln))
+
+			sender := newUDPConnLocalhost(t)
+			payload := append(append(bytes.Repeat([]byte{0x04}, 500), bytes.Repeat([]byte{0x05}, 500)...), bytes.Repeat([]byte{0x06}, 300)...)
+			_, _, err := sender.WriteMsgUDP(payload, appendUDPSegmentSizeMsg(nil, 500), ln.LocalAddr().(*net.UDPAddr))
+			require.NoError(t, err)
+			for _, want := range [][]byte{payload[:500], payload[500:1000], payload[1000:]} {
+				select {
+				case b := <-got:
+					require.Equal(t, want, b)
+				case <-time.After(time.Second):
+					t.Fatal("timeout waiting for a datagram")
+				}
+			}
+			select {
+			case <-ends:
+			case <-time.After(time.Second):
+				t.Fatal("timeout waiting for the batch end")
+			}
+			require.Empty(t, got)
+		})
+	}
 }

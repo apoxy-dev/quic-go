@@ -142,6 +142,12 @@ type Transport struct {
 	// NonQUICPacketHandler can keep copies of the packets of a read and write them here.
 	NonQUICBatchEnd func()
 
+	// EnableGRO turns on UDP GRO on Conn, on Linux 5.12 and later. The kernel then joins the
+	// datagrams of one flow that arrive together, and the read loop gets them with fewer syscalls.
+	// Do not set it when Conn shares its port with a program that needs one packet for each
+	// datagram, for example an XDP program in generic mode. QUIC_GO_DISABLE_GRO=true keeps it off.
+	EnableGRO bool
+
 	connMx      sync.Mutex
 	handlers    map[protocol.ConnectionID]packetHandler
 	resetTokens map[protocol.StatelessResetToken]packetHandler
@@ -396,7 +402,7 @@ func (t *Transport) init(allowZeroLengthConnIDs bool) error {
 			conn = c
 		} else {
 			var err error
-			conn, err = wrapConn(t.Conn)
+			conn, err = wrapConn(t.Conn, t.EnableGRO)
 			if err != nil {
 				t.initErr = err
 				return
