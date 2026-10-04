@@ -585,11 +585,18 @@ func (t *Transport) maybeStopListening() {
 	}
 }
 
+// isQUICPacket reports whether the first byte of b is one of a QUIC packet.
+func isQUICPacket(b []byte) bool {
+	return len(b) > 0 && (wire.IsPotentialQUICPacket(b[0]) || wire.IsLongHeaderPacket(b[0]))
+}
+
 func (t *Transport) handlePacket(p receivedPacket) {
 	if len(p.data) == 0 {
+		p.buffer.Decrement()
+		p.buffer.MaybeRelease()
 		return
 	}
-	if !wire.IsPotentialQUICPacket(p.data[0]) && !wire.IsLongHeaderPacket(p.data[0]) {
+	if !isQUICPacket(p.data) {
 		t.handleNonQUICPacket(p)
 		return
 	}
@@ -705,12 +712,16 @@ func (t *Transport) maybeHandleStatelessReset(data []byte) bool {
 func (t *Transport) handleNonQUICPacket(p receivedPacket) {
 	if t.NonQUICPacketHandler != nil {
 		t.NonQUICPacketHandler(p.data, p.remoteAddr)
-		p.buffer.Release()
+		// With GRO, the datagrams of one read share the buffer.
+		p.buffer.Decrement()
+		p.buffer.MaybeRelease()
 		return
 	}
 	// Strictly speaking, this is racy,
 	// but we only care about receiving packets at some point after ReadNonQUICPacket has been called.
 	if !t.readingNonQUICPackets.Load() {
+		p.buffer.Decrement()
+		p.buffer.MaybeRelease()
 		return
 	}
 	select {
@@ -719,6 +730,8 @@ func (t *Transport) handleNonQUICPacket(p receivedPacket) {
 		if t.Tracer != nil && t.Tracer.DroppedPacket != nil {
 			t.Tracer.DroppedPacket(p.remoteAddr, logging.PacketTypeNotDetermined, p.Size(), logging.PacketDropDOSPrevention)
 		}
+		p.buffer.Decrement()
+		p.buffer.MaybeRelease()
 	}
 }
 

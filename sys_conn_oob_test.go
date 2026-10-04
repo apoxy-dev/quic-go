@@ -276,6 +276,8 @@ func (c *oobRecordingConn) WriteMsgUDP(b, oob []byte, addr *net.UDPAddr) (n, oob
 type mockBatchConn struct {
 	t          *testing.T
 	numMsgRead int
+	// batch and bufSize are the messages and the buffer size that a read must have.
+	batch, bufSize int
 
 	callCounter int
 }
@@ -283,10 +285,10 @@ type mockBatchConn struct {
 var _ batchConn = &mockBatchConn{}
 
 func (c *mockBatchConn) ReadBatch(ms []ipv4.Message, _ int) (int, error) {
-	require.Len(c.t, ms, batchSize)
+	require.Len(c.t, ms, c.batch)
 	for i := 0; i < c.numMsgRead; i++ {
 		require.Len(c.t, ms[i].Buffers, 1)
-		require.Len(c.t, ms[i].Buffers[0], protocol.MaxPacketBufferSize)
+		require.Len(c.t, ms[i].Buffers[0], c.bufSize)
 		data := []byte(fmt.Sprintf("message %d", c.callCounter*c.numMsgRead+i))
 		ms[i].Buffers[0] = data
 		ms[i].N = len(data)
@@ -295,16 +297,24 @@ func (c *mockBatchConn) ReadBatch(ms []ipv4.Message, _ int) (int, error) {
 	return c.numMsgRead, nil
 }
 
-func TestReadsMultipleMessagesInOneBatch(t *testing.T) {
-	bc := &mockBatchConn{t: t, numMsgRead: batchSize/2 + 1}
+// readBufferSize returns the buffer size of one message of a read of c.
+func readBufferSize(c *oobConn) int {
+	if c.capabilities().GRO {
+		return protocol.MaxGROPacketBufferSize
+	}
+	return protocol.MaxPacketBufferSize
+}
 
+func TestReadsMultipleMessagesInOneBatch(t *testing.T) {
 	udpConn := newUDPConnLocalhost(t)
 	oobConn, err := newConn(udpConn, true)
 	require.NoError(t, err)
+	batch := oobConn.batch
+	bc := &mockBatchConn{t: t, numMsgRead: batch/2 + 1, batch: batch, bufSize: readBufferSize(oobConn)}
 	oobConn.batchConn = bc
 
 	var readTime time.Time
-	for i := 0; i < batchSize+1; i++ {
+	for i := 0; i < batch+1; i++ {
 		before := time.Now()
 		p, err := oobConn.ReadPacket()
 		require.NoError(t, err)
@@ -352,38 +362,38 @@ func (c *singleReader) ReadFrom(b []byte) (int, net.Addr, error) {
 
 func TestTransportNonQUICBatchEnd(t *testing.T) {
 	cases := []struct {
-		name  string
-		sizes []int
-		conn  func(t *testing.T, sizes []int) net.PacketConn
+		name string
+		// conn returns the conn and the packets of each of its reads.
+		conn func(t *testing.T) (net.PacketConn, []int)
 	}{
 		{
-			name:  "batched reads",
-			sizes: []int{batchSize, 1, batchSize/2 + 1},
-			conn: func(t *testing.T, sizes []int) net.PacketConn {
+			name: "batched reads",
+			conn: func(t *testing.T) (net.PacketConn, []int) {
 				c, err := newConn(newUDPConnLocalhost(t), true)
 				require.NoError(t, err)
+				sizes := []int{c.batch, 1, c.batch/2 + 1}
 				c.batchConn = &batchReader{sizes: sizes}
-				return c
+				return c, sizes
 			},
 		},
 		{
-			name:  "single reads",
-			sizes: []int{1, 1, 1},
-			conn: func(t *testing.T, sizes []int) net.PacketConn {
+			name: "single reads",
+			conn: func(t *testing.T) (net.PacketConn, []int) {
 				t.Setenv("QUIC_GO_DISABLE_RECEIVE_BUFFER_WARNING", "true")
-				return &singleReader{PacketConn: newUDPConnLocalhost(t), n: len(sizes)}
+				return &singleReader{PacketConn: newUDPConnLocalhost(t), n: 3}, []int{1, 1, 1}
 			},
 		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
+			conn, sizes := tc.conn(t)
 			// p is one packet, and e is one batch end.
 			var want, got strings.Builder
-			for _, n := range tc.sizes {
+			for _, n := range sizes {
 				want.WriteString(strings.Repeat("p", n) + "e")
 			}
 			tr := &Transport{
-				Conn:                 tc.conn(t, tc.sizes),
+				Conn:                 conn,
 				NonQUICPacketHandler: func([]byte, net.Addr) { got.WriteByte('p') },
 				NonQUICBatchEnd:      func() { got.WriteByte('e') },
 			}

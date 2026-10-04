@@ -63,10 +63,14 @@ func (b *packetBuffer) putBack() {
 		largeBufferPool.Put(b)
 		return
 	}
+	if cap(b.Data) == protocol.MaxGROPacketBufferSize {
+		groBufferPool.Put(b)
+		return
+	}
 	panic("putPacketBuffer called with packet of wrong size!")
 }
 
-var bufferPool, largeBufferPool sync.Pool
+var bufferPool, largeBufferPool, groBufferPool sync.Pool
 
 func getPacketBuffer() *packetBuffer {
 	buf := bufferPool.Get().(*packetBuffer)
@@ -82,11 +86,22 @@ func getLargePacketBuffer() *packetBuffer {
 	return buf
 }
 
+// getGROPacketBuffer returns a buffer for one message of a read with GRO.
+func getGROPacketBuffer() *packetBuffer {
+	buf := groBufferPool.Get().(*packetBuffer)
+	buf.refCount = 1
+	buf.Data = buf.Data[:0]
+	return buf
+}
+
 func init() {
 	bufferPool.New = func() any {
 		return &packetBuffer{Data: make([]byte, 0, protocol.MaxPacketBufferSize)}
 	}
 	largeBufferPool.New = func() any {
 		return &packetBuffer{Data: make([]byte, 0, protocol.MaxLargePacketBufferSize)}
+	}
+	groBufferPool.New = func() any {
+		return &packetBuffer{Data: make([]byte, 0, protocol.MaxGROPacketBufferSize)}
 	}
 }

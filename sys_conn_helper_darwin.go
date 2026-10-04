@@ -13,6 +13,8 @@ import (
 const (
 	msgTypeIPTOS = unix.IP_RECVTOS
 	ipv4PKTINFO  = unix.IP_RECVPKTINFO
+	// The kernel has no UDP GRO, so no control message has this type.
+	msgTypeUDPGRO = -1
 )
 
 const ecnIPv4DataLen = 4
@@ -20,6 +22,9 @@ const ecnIPv4DataLen = 4
 // ReadBatch only returns a single packet on OSX,
 // see https://godoc.org/golang.org/x/net/ipv4#PacketConn.ReadBatch.
 const batchSize = 1
+
+// groBatchSize is not used: the kernel has no UDP GRO.
+const groBatchSize = batchSize
 
 func parseIPv4PktInfo(body []byte) (ip netip.Addr, ifIndex uint32, ok bool) {
 	// struct in_pktinfo {
@@ -34,5 +39,7 @@ func parseIPv4PktInfo(body []byte) (ip netip.Addr, ifIndex uint32, ok bool) {
 }
 
 func isGSOEnabled(syscall.RawConn) bool { return false }
+
+func isGROEnabled(syscall.RawConn) bool { return false }
 
 func isECNEnabled() bool { return !isECNDisabledUsingEnv() }

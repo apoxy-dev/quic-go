@@ -72,7 +72,14 @@ type oobConn struct {
 	// Packets received from the kernel, but not yet returned by ReadPacket().
 	messages []ipv4.Message
 	buffers  [batchSize]*packetBuffer
+	batch    int       // Messages of one read.
 	rcvTime  time.Time // All packets of one read get the time of the read.
+	// seg is the message that ReadPacket splits now: the packet with the
+	// datagrams that are left in data, and the datagram size.
+	seg struct {
+		p    receivedPacket
+		size int
+	}
 
 	cap connCapabilities
 }
@@ -138,6 +145,12 @@ func newConn(c OOBCapablePacketConn, supportsDF bool) (*oobConn, error) {
 		bc = ipv4.NewPacketConn(c)
 	}
 
+	// With GRO, each message holds up to 64 KiB, so a read has fewer messages.
+	gro := isGROEnabled(rawConn)
+	batch := batchSize
+	if gro {
+		batch = groBatchSize
+	}
 	msgs := make([]ipv4.Message, batchSize)
 	for i := range msgs {
 		// preallocate the [][]byte
@@ -146,12 +159,14 @@ func newConn(c OOBCapablePacketConn, supportsDF bool) (*oobConn, error) {
 	oobConn := &oobConn{
 		OOBCapablePacketConn: c,
 		batchConn:            bc,
-		messages:             msgs,
-		readPos:              batchSize,
+		messages:             msgs[:batch],
+		batch:                batch,
+		readPos:              uint8(batch),
 		cap: connCapabilities{
 			DF:  supportsDF,
 			GSO: isGSOEnabled(rawConn),
 			ECN: isECNEnabled(),
+			GRO: gro,
 		},
 	}
 	for i := 0; i < batchSize; i++ {
@@ -163,16 +178,32 @@ func newConn(c OOBCapablePacketConn, supportsDF bool) (*oobConn, error) {
 var invalidCmsgOnceV4, invalidCmsgOnceV6 sync.Once
 
 // buffered reports if packets of the last batch are left to read.
-func (c *oobConn) buffered() bool { return int(c.readPos) < len(c.messages) }
+func (c *oobConn) buffered() bool {
+	return len(c.seg.p.data) > 0 || int(c.readPos) < len(c.messages)
+}
+
+// getReadBuffer returns a buffer for one message of a read. With GRO, it holds
+// the largest datagram that the kernel can join.
+func (c *oobConn) getReadBuffer() *packetBuffer {
+	var b *packetBuffer
+	if c.cap.GRO {
+		b = getGROPacketBuffer()
+	} else {
+		b = getPacketBuffer()
+	}
+	b.Data = b.Data[:cap(b.Data)]
+	return b
+}
 
 func (c *oobConn) ReadPacket() (receivedPacket, error) {
+	if len(c.seg.p.data) > 0 { // datagrams of a joined message are left
+		return c.nextDatagram(), nil
+	}
 	if len(c.messages) == int(c.readPos) { // all messages read. Read the next batch of messages.
-		c.messages = c.messages[:batchSize]
+		c.messages = c.messages[:c.batch]
 		// replace buffers data buffers up to the packet that has been consumed during the last ReadBatch call
 		for i := uint8(0); i < c.readPos; i++ {
-			buffer := getPacketBuffer()
-			buffer.Data = buffer.Data[:protocol.MaxPacketBufferSize]
-			c.buffers[i] = buffer
+			c.buffers[i] = c.getReadBuffer()
 			c.messages[i].Buffers[0] = c.buffers[i].Data
 		}
 		c.readPos = 0
@@ -196,10 +227,14 @@ func (c *oobConn) ReadPacket() (receivedPacket, error) {
 		data:       msg.Buffers[0][:msg.N],
 		buffer:     buffer,
 	}
+	var segSize int
 	for len(data) > 0 {
 		hdr, body, remainder, err := unix.ParseOneSocketControlMessage(data)
 		if err != nil {
 			return receivedPacket{}, err
+		}
+		if hdr.Level == unix.IPPROTO_UDP && hdr.Type == msgTypeUDPGRO && len(body) == 4 {
+			segSize = int(binary.NativeEndian.Uint32(body))
 		}
 		if hdr.Level == unix.IPPROTO_IP {
 			switch hdr.Type {
@@ -247,7 +282,38 @@ func (c *oobConn) ReadPacket() (receivedPacket, error) {
 		}
 		data = remainder
 	}
-	return p, nil
+	if !c.cap.GRO {
+		return p, nil
+	}
+	// Without a UDP_GRO message, the message is one datagram.
+	if segSize <= 0 {
+		segSize = len(p.data)
+	}
+	c.seg.p, c.seg.size = p, segSize
+	return c.nextDatagram(), nil
+}
+
+// nextDatagram returns the next datagram of the message in seg. A QUIC datagram
+// gets a copy in its own buffer, because a connection releases its buffer on
+// another goroutine. A non-QUIC datagram shares the buffer of the message, and
+// the read loop releases it when the handler returns.
+func (c *oobConn) nextDatagram() receivedPacket {
+	p := c.seg.p
+	n := min(c.seg.size, len(p.data))
+	p.data, c.seg.p.data = p.data[:n:n], p.data[n:]
+	if isQUICPacket(p.data) {
+		b := getPacketBuffer()
+		b.Data = append(b.Data, p.data[:min(n, protocol.MaxPacketBufferSize)]...)
+		p.data, p.buffer = b.Data, b
+	} else {
+		p.buffer.Split()
+	}
+	if len(c.seg.p.data) == 0 {
+		// All datagrams are out. Drop the reference of the read.
+		c.seg.p.buffer.Decrement()
+		c.seg.p.buffer.MaybeRelease()
+	}
+	return p
 }
 
 // WritePacket writes a new packet.

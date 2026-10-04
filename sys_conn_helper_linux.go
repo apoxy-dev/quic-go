@@ -15,8 +15,9 @@ import (
 )
 
 const (
-	msgTypeIPTOS = unix.IP_TOS
-	ipv4PKTINFO  = unix.IP_PKTINFO
+	msgTypeIPTOS  = unix.IP_TOS
+	ipv4PKTINFO   = unix.IP_PKTINFO
+	msgTypeUDPGRO = unix.UDP_GRO
 )
 
 const ecnIPv4DataLen = 1
@@ -25,10 +26,14 @@ const ecnIPv4DataLen = 1
 // MaxUint8, the limit of oobConn.readPos.
 const batchSize = 64
 
-var kernelVersionMajor int
+// groBatchSize is the most messages of one recvmmsg call with GRO. Each message
+// can hold the datagrams of one flow up to MaxGROPacketBufferSize.
+const groBatchSize = 64
+
+var kernelVersionMajor, kernelVersionMinor int
 
 func init() {
-	kernelVersionMajor, _ = kernelVersion()
+	kernelVersionMajor, kernelVersionMinor = kernelVersion()
 }
 
 func forceSetReceiveBuffer(c syscall.RawConn, bytes int) error {
@@ -76,6 +81,26 @@ func isGSOEnabled(conn syscall.RawConn) bool {
 	var serr error
 	if err := conn.Control(func(fd uintptr) {
 		_, serr = unix.GetsockoptInt(int(fd), unix.IPPROTO_UDP, unix.UDP_SEGMENT)
+	}); err != nil {
+		return false
+	}
+	return serr == nil
+}
+
+// isGROEnabled turns on UDP GRO on the socket. The kernel then joins the
+// datagrams of one flow that arrive together, and gives the datagram size in a
+// UDP_GRO control message. Kernels before 5.12 have known UDP GRO faults.
+func isGROEnabled(conn syscall.RawConn) bool {
+	if kernelVersionMajor < 5 || (kernelVersionMajor == 5 && kernelVersionMinor < 12) {
+		return false
+	}
+	disabled, err := strconv.ParseBool(os.Getenv("QUIC_GO_DISABLE_GRO"))
+	if err == nil && disabled {
+		return false
+	}
+	var serr error
+	if err := conn.Control(func(fd uintptr) {
+		serr = unix.SetsockoptInt(int(fd), unix.IPPROTO_UDP, unix.UDP_GRO, 1)
 	}); err != nil {
 		return false
 	}

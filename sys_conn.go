@@ -22,6 +22,9 @@ type connCapabilities struct {
 	GSO bool
 	// ECN (Explicit Congestion Notifications) supported
 	ECN bool
+	// GRO (Generic Receive Offload) on: a read can return the datagrams of
+	// one flow joined into one message.
+	GRO bool
 }
 
 // rawConn is a connection that allow reading of a receivedPackeh.
