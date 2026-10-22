@@ -98,21 +98,41 @@ func newDatagramQueue(hasData func(), logger utils.Logger) *datagramQueue {
 // Add queues a DATAGRAM frame to send.
 // When the send queue is full, Add blocks until the packer takes a frame.
 func (h *datagramQueue) Add(f *wire.DatagramFrame) error {
-	for {
-		h.sendMx.Lock()
-		if h.sendQueue.Len() < maxDatagramSendQueueLen {
-			h.sendQueue.PushBack(f)
-			h.sendMx.Unlock()
-			h.hasData()
-			return nil
-		}
-		h.sendMx.Unlock()
+	for !h.push(f) {
 		select {
 		case <-h.closed:
 			return h.closeErr
 		case <-h.sent:
 		}
 	}
+	return nil
+}
+
+// TryAdd queues a DATAGRAM frame to send.
+// When the send queue is full, TryAdd returns ErrDatagramQueueFull at once.
+func (h *datagramQueue) TryAdd(f *wire.DatagramFrame) error {
+	if h.push(f) {
+		return nil
+	}
+	select {
+	case <-h.closed:
+		return h.closeErr
+	default:
+		return ErrDatagramQueueFull
+	}
+}
+
+// push queues f if the send queue is not full.
+func (h *datagramQueue) push(f *wire.DatagramFrame) bool {
+	h.sendMx.Lock()
+	if h.sendQueue.Len() >= maxDatagramSendQueueLen {
+		h.sendMx.Unlock()
+		return false
+	}
+	h.sendQueue.PushBack(f)
+	h.sendMx.Unlock()
+	h.hasData()
+	return true
 }
 
 // Peek returns the next DATAGRAM frame to send, or nil.

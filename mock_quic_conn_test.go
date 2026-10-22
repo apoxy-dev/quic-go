@@ -658,6 +658,44 @@ func (c *MockQUICConnSendDatagramCall) DoAndReturn(f func([]byte) error) *MockQU
 	return c
 }
 
+// TrySendDatagram mocks base method.
+func (m *MockQUICConn) TrySendDatagram(payload []byte) error {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "TrySendDatagram", payload)
+	ret0, _ := ret[0].(error)
+	return ret0
+}
+
+// TrySendDatagram indicates an expected call of TrySendDatagram.
+func (mr *MockQUICConnMockRecorder) TrySendDatagram(payload any) *MockQUICConnTrySendDatagramCall {
+	mr.mock.ctrl.T.Helper()
+	call := mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "TrySendDatagram", reflect.TypeOf((*MockQUICConn)(nil).TrySendDatagram), payload)
+	return &MockQUICConnTrySendDatagramCall{Call: call}
+}
+
+// MockQUICConnTrySendDatagramCall wrap *gomock.Call
+type MockQUICConnTrySendDatagramCall struct {
+	*gomock.Call
+}
+
+// Return rewrite *gomock.Call.Return
+func (c *MockQUICConnTrySendDatagramCall) Return(arg0 error) *MockQUICConnTrySendDatagramCall {
+	c.Call = c.Call.Return(arg0)
+	return c
+}
+
+// Do rewrite *gomock.Call.Do
+func (c *MockQUICConnTrySendDatagramCall) Do(f func([]byte) error) *MockQUICConnTrySendDatagramCall {
+	c.Call = c.Call.Do(f)
+	return c
+}
+
+// DoAndReturn rewrite *gomock.Call.DoAndReturn
+func (c *MockQUICConnTrySendDatagramCall) DoAndReturn(f func([]byte) error) *MockQUICConnTrySendDatagramCall {
+	c.Call = c.Call.DoAndReturn(f)
+	return c
+}
+
 // closeWithTransportError mocks base method.
 func (m *MockQUICConn) closeWithTransportError(arg0 TransportErrorCode) {
 	m.ctrl.T.Helper()

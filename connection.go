@@ -2651,6 +2651,14 @@ func (s *connection) onStreamCompleted(id protocol.StreamID) {
 }
 
 func (s *connection) SendDatagram(p []byte) error {
+	return s.sendDatagram(p, s.datagramQueue.Add)
+}
+
+func (s *connection) TrySendDatagram(p []byte) error {
+	return s.sendDatagram(p, s.datagramQueue.TryAdd)
+}
+
+func (s *connection) sendDatagram(p []byte, add func(*wire.DatagramFrame) error) error {
 	if !s.supportsDatagrams() {
 		return errors.New("datagram support disabled")
 	}
@@ -2667,7 +2675,7 @@ func (s *connection) SendDatagram(p []byte) error {
 	}
 	f.Data = getDatagramBuffer(len(p))
 	copy(f.Data, p)
-	if err := s.datagramQueue.Add(f); err != nil {
+	if err := add(f); err != nil {
 		ReleaseDatagram(f.Data)
 		return err
 	}

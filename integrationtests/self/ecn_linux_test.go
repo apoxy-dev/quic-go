@@ -7,7 +7,6 @@ import (
 	"io"
 	"os"
 	"strconv"
-	"sync"
 	"testing"
 	"time"
 
@@ -16,29 +15,6 @@ import (
 
 	"github.com/stretchr/testify/require"
 )
-
-// ecnCounter counts the ECN codepoints of the 1-RTT packets that a connection receives.
-// The quic-go socket reads the TOS byte of each packet with IP_RECVTOS.
-type ecnCounter struct {
-	mu     sync.Mutex
-	counts map[logging.ECN]int
-}
-
-func (c *ecnCounter) tracer(context.Context, logging.Perspective, quic.ConnectionID) *logging.ConnectionTracer {
-	return &logging.ConnectionTracer{
-		ReceivedShortHeaderPacket: func(_ *logging.ShortHeader, _ logging.ByteCount, ecn logging.ECN, _ []logging.Frame) {
-			c.mu.Lock()
-			defer c.mu.Unlock()
-			c.counts[ecn]++
-		},
-	}
-}
-
-func (c *ecnCounter) get(ecn logging.ECN) int {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	return c.counts[ecn]
-}
 
 func TestDisableECN(t *testing.T) {
 	if off, _ := strconv.ParseBool(os.Getenv("QUIC_GO_DISABLE_ECN")); off {

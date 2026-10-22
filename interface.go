@@ -196,6 +196,9 @@ type Connection interface {
 	// If the payload is too large to be sent at the current time, a DatagramTooLargeError is returned.
 	// SendDatagram copies the payload, so the caller can use it again when the call returns.
 	SendDatagram(payload []byte) error
+	// TrySendDatagram is SendDatagram that does not block: when the send queue is full,
+	// it returns ErrDatagramQueueFull at once and drops the payload.
+	TrySendDatagram(payload []byte) error
 	// ReceiveDatagram gets a message received in a datagram, as specified in RFC 9221.
 	// The caller can give the message back with ReleaseDatagram when it does not use it any more.
 	ReceiveDatagram(context.Context) ([]byte, error)

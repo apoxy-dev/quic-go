@@ -658,3 +658,41 @@ func (c *MockEarlyConnectionSendDatagramCall) DoAndReturn(f func([]byte) error) 
 	c.Call = c.Call.DoAndReturn(f)
 	return c
 }
+
+// TrySendDatagram mocks base method.
+func (m *MockEarlyConnection) TrySendDatagram(payload []byte) error {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "TrySendDatagram", payload)
+	ret0, _ := ret[0].(error)
+	return ret0
+}
+
+// TrySendDatagram indicates an expected call of TrySendDatagram.
+func (mr *MockEarlyConnectionMockRecorder) TrySendDatagram(payload any) *MockEarlyConnectionTrySendDatagramCall {
+	mr.mock.ctrl.T.Helper()
+	call := mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "TrySendDatagram", reflect.TypeOf((*MockEarlyConnection)(nil).TrySendDatagram), payload)
+	return &MockEarlyConnectionTrySendDatagramCall{Call: call}
+}
+
+// MockEarlyConnectionTrySendDatagramCall wrap *gomock.Call
+type MockEarlyConnectionTrySendDatagramCall struct {
+	*gomock.Call
+}
+
+// Return rewrite *gomock.Call.Return
+func (c *MockEarlyConnectionTrySendDatagramCall) Return(arg0 error) *MockEarlyConnectionTrySendDatagramCall {
+	c.Call = c.Call.Return(arg0)
+	return c
+}
+
+// Do rewrite *gomock.Call.Do
+func (c *MockEarlyConnectionTrySendDatagramCall) Do(f func([]byte) error) *MockEarlyConnectionTrySendDatagramCall {
+	c.Call = c.Call.Do(f)
+	return c
+}
+
+// DoAndReturn rewrite *gomock.Call.DoAndReturn
+func (c *MockEarlyConnectionTrySendDatagramCall) DoAndReturn(f func([]byte) error) *MockEarlyConnectionTrySendDatagramCall {
+	c.Call = c.Call.DoAndReturn(f)
+	return c
+}

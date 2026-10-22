@@ -54,8 +54,22 @@ type OOBCapablePacketConn interface {
 
 var _ OOBCapablePacketConn = &net.UDPConn{}
 
+// ECNPacketConn is a connection that reads and writes the ECN bits of the IP header itself,
+// for example a connection on a user-space network stack.
+// If the PacketConn passed to the [Transport] satisfies this interface, quic-go uses
+// ReadFromECN and WriteToECN to read and write packets, with ECN and the DF bit on.
+// ecn holds the two ECN bits of the IP header: 0b00 Not-ECT, 0b01 ECT(1), 0b10 ECT(0), 0b11 CE.
+type ECNPacketConn interface {
+	net.PacketConn
+	ReadFromECN(b []byte) (n int, addr net.Addr, ecn uint8, err error)
+	WriteToECN(b []byte, addr net.Addr, ecn uint8) (int, error)
+}
+
 // wrapConn wraps pc. gro asks for UDP GRO on the socket.
 func wrapConn(pc net.PacketConn, gro bool) (rawConn, error) {
+	if c, ok := pc.(ECNPacketConn); ok {
+		return &ecnConn{ECNPacketConn: c}, nil
+	}
 	if err := setReceiveBuffer(pc); err != nil {
 		if !strings.Contains(err.Error(), "use of closed network connection") {
 			setBufferWarningOnce.Do(func() {
@@ -144,3 +158,41 @@ func (c *basicConn) WritePacket(b []byte, addr net.Addr, _ []byte, gsoSize uint1
 }
 
 func (c *basicConn) capabilities() connCapabilities { return connCapabilities{DF: c.supportsDF} }
+
+// The ecnConn reads and writes packets with their ECN bits through an ECNPacketConn.
+// The ECNPacketConn sets the DF bit of each packet.
+type ecnConn struct {
+	ECNPacketConn
+}
+
+var _ rawConn = &ecnConn{}
+
+func (c *ecnConn) ReadPacket() (receivedPacket, error) {
+	buffer := getPacketBuffer()
+	buffer.Data = buffer.Data[:protocol.MaxPacketBufferSize]
+	n, addr, ecn, err := c.ReadFromECN(buffer.Data)
+	if err != nil {
+		buffer.Release()
+		return receivedPacket{}, err
+	}
+	return receivedPacket{
+		remoteAddr: addr,
+		rcvTime:    time.Now(),
+		data:       buffer.Data[:n],
+		ecn:        protocol.ParseECNHeaderBits(ecn & 0b11),
+		buffer:     buffer,
+	}, nil
+}
+
+func (c *ecnConn) WritePacket(b []byte, addr net.Addr, _ []byte, gsoSize uint16, ecn protocol.ECN) (int, error) {
+	if gsoSize != 0 {
+		panic("cannot use GSO with an ecnConn")
+	}
+	var bits uint8
+	if ecn != protocol.ECNUnsupported {
+		bits = ecn.ToHeaderBits()
+	}
+	return c.WriteToECN(b, addr, bits)
+}
+
+func (c *ecnConn) capabilities() connCapabilities { return connCapabilities{DF: true, ECN: true} }

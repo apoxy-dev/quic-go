@@ -1,6 +1,7 @@
 package quic
 
 import (
+	"errors"
 	"fmt"
 
 	"github.com/quic-go/quic-go/internal/qerr"
@@ -73,3 +74,6 @@ func (e *DatagramTooLargeError) Is(target error) bool {
 }
 
 func (e *DatagramTooLargeError) Error() string { return "DATAGRAM frame too large" }
+
+// ErrDatagramQueueFull is returned from Connection.TrySendDatagram if the send queue is full.
+var ErrDatagramQueueFull = errors.New("DATAGRAM send queue full")
