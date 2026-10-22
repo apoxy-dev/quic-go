@@ -7,7 +7,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/quic-go/quic-go/integrationtests/tools/israce"
 	"github.com/quic-go/quic-go/internal/ackhandler"
 	"github.com/quic-go/quic-go/internal/protocol"
 	"github.com/quic-go/quic-go/internal/synctest"
@@ -269,7 +268,7 @@ func TestDatagramBuffers(t *testing.T) {
 			}
 			ReleaseDatagram(got)
 
-			if israce.Enabled {
+			if raceEnabled {
 				t.Skip("sync.Pool drops buffers when the race detector is on")
 			}
 			allocs := testing.AllocsPerRun(100, func() {

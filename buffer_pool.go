@@ -86,14 +86,6 @@ func getLargePacketBuffer() *packetBuffer {
 	return buf
 }
 
-// getGROPacketBuffer returns a buffer for one message of a read with GRO.
-func getGROPacketBuffer() *packetBuffer {
-	buf := groBufferPool.Get().(*packetBuffer)
-	buf.refCount = 1
-	buf.Data = buf.Data[:0]
-	return buf
-}
-
 func init() {
 	bufferPool.New = func() any {
 		return &packetBuffer{Data: make([]byte, 0, protocol.MaxPacketBufferSize)}

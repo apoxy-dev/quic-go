@@ -182,6 +182,14 @@ func (c *oobConn) buffered() bool {
 	return len(c.seg.p.data) > 0 || int(c.readPos) < len(c.messages)
 }
 
+// getGROPacketBuffer returns a buffer for one message of a read with GRO.
+func getGROPacketBuffer() *packetBuffer {
+	buf := groBufferPool.Get().(*packetBuffer)
+	buf.refCount = 1
+	buf.Data = buf.Data[:0]
+	return buf
+}
+
 // getReadBuffer returns a buffer for one message of a read. With GRO, it holds
 // the largest datagram that the kernel can join.
 func (c *oobConn) getReadBuffer() *packetBuffer {

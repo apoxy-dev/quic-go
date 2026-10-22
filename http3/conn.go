@@ -13,7 +13,6 @@ import (
 
 	"github.com/quic-go/quic-go"
 	"github.com/quic-go/quic-go/http3/qlog"
-	"github.com/quic-go/quic-go/internal/wire"
 	"github.com/quic-go/quic-go/qlogwriter"
 	"github.com/quic-go/quic-go/quicvarint"
 )
@@ -23,9 +22,13 @@ const maxQuarterStreamID = 1<<60 - 1
 // invalidStreamID is a stream ID that is invalid. The first valid stream ID in QUIC is 0.
 const invalidStreamID = quic.StreamID(-1)
 
+// maxDatagramSize is the largest DATAGRAM frame that has a 2 byte varint length (RFC 9221).
+const maxDatagramSize = 16383
+
 var datagramBufferPool = sync.Pool{
 	New: func() any {
-		return make([]byte, 0, wire.MaxDatagramSize)
+		b := make([]byte, 0, maxDatagramSize)
+		return &b
 	},
 }
 
@@ -257,8 +260,12 @@ func (c *rawConn) handleControlStream(str *quic.ReceiveStream) {
 }
 
 func (c *rawConn) sendDatagram(streamID quic.StreamID, b []byte) error {
-	data := datagramBufferPool.Get().([]byte)
-	defer datagramBufferPool.Put(data[:0])
+	buf := datagramBufferPool.Get().(*[]byte)
+	data := (*buf)[:0]
+	defer func() {
+		*buf = data[:0]
+		datagramBufferPool.Put(buf)
+	}()
 	quarterStreamID := uint64(streamID / 4)
 	data = quicvarint.Append(data, uint64(streamID/4))
 	data = append(data, b...)

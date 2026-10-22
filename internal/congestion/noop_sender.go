@@ -28,6 +28,7 @@ func (n *NoopSender) CanSend(protocol.ByteCount) bool { return true }
 func (n *NoopSender) MaybeExitSlowStart()             {}
 func (n *NoopSender) OnPacketAcked(protocol.PacketNumber, protocol.ByteCount, protocol.ByteCount, monotime.Time) {
 }
+
 func (n *NoopSender) OnCongestionEvent(protocol.PacketNumber, protocol.ByteCount, protocol.ByteCount) {
 }
 func (n *NoopSender) OnRetransmissionTimeout(bool)            {}
