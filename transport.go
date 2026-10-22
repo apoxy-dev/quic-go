@@ -67,6 +67,9 @@ type Transport struct {
 	// 3. It uses batched syscalls (recvmmsg) to more efficiently receive packets from the socket.
 	// 4. It uses Generic Segmentation Offload (GSO) to efficiently send batches of packets (on Linux).
 	//
+	// A connection that implements the ECNPacketConn interface reads and writes the ECN bits itself.
+	// quic-go then uses ECN and DPLPMTUD with it.
+	//
 	// After passing the connection to the Transport, it's invalid to call ReadFrom or WriteTo on the connection.
 	Conn net.PacketConn
 

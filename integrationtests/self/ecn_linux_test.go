@@ -17,18 +17,6 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// countECN counts the ECN codepoints of the 1-RTT packets that a connection received.
-// The quic-go socket reads the TOS byte of each packet with IP_RECVTOS.
-func countECN(r *events.Recorder) map[qlog.ECN]int {
-	counts := make(map[qlog.ECN]int)
-	for _, ev := range r.Events(qlog.PacketReceived{}) {
-		if p := ev.(qlog.PacketReceived); p.Header.PacketType == qlog.PacketType1RTT {
-			counts[p.ECN]++
-		}
-	}
-	return counts
-}
-
 func TestDisableECN(t *testing.T) {
 	if off, _ := strconv.ParseBool(os.Getenv("QUIC_GO_DISABLE_ECN")); off {
 		t.Skip("QUIC_GO_DISABLE_ECN turns ECN off for all connections")
@@ -88,7 +76,8 @@ func TestDisableECN(t *testing.T) {
 				off  bool
 			}{{"client", &fromClient, tc.clientOff}, {"server", &fromServer, tc.serverOff}} {
 				counts := countECN(side.rcvd)
-				ect0, notECT := counts[qlog.ECT0], counts[qlog.ECTNot]
+				// qlog writes Not-ECT as ECNUnsupported.
+				ect0, notECT := counts[qlog.ECT0], counts[qlog.ECTNot]+counts[qlog.ECNUnsupported]
 				t.Logf("Packets from the %s: %d ECT(0), %d Not-ECT", side.name, ect0, notECT)
 				if side.off {
 					require.Zero(t, ect0, "the %s sent ECT(0) packets", side.name)

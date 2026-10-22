@@ -3081,6 +3081,16 @@ func (c *Conn) onStreamCompleted(id protocol.StreamID) {
 // If the payload is too large to be sent at the current time, a DatagramTooLargeError is returned.
 // SendDatagram copies the payload, so the caller can use it again when the call returns.
 func (c *Conn) SendDatagram(p []byte) error {
+	return c.sendDatagram(p, c.datagramQueue.Add)
+}
+
+// TrySendDatagram is SendDatagram that does not block: when the send queue is full,
+// it returns ErrDatagramQueueFull at once and drops the payload.
+func (c *Conn) TrySendDatagram(p []byte) error {
+	return c.sendDatagram(p, c.datagramQueue.TryAdd)
+}
+
+func (c *Conn) sendDatagram(p []byte, add func(*wire.DatagramFrame) error) error {
 	if !c.supportsDatagrams() {
 		return errors.New("datagram support disabled")
 	}
@@ -3097,7 +3107,7 @@ func (c *Conn) SendDatagram(p []byte) error {
 	}
 	f.Data = getDatagramBuffer(len(p))
 	copy(f.Data, p)
-	if err := c.datagramQueue.Add(f); err != nil {
+	if err := add(f); err != nil {
 		ReleaseDatagram(f.Data)
 		return err
 	}

@@ -5,6 +5,7 @@ import (
 	"context"
 	"strconv"
 	"testing"
+	"time"
 
 	"github.com/quic-go/quic-go/integrationtests/tools/israce"
 	"github.com/quic-go/quic-go/internal/ackhandler"
@@ -75,6 +76,46 @@ func TestDatagramQueueSendQueueLength(t *testing.T) {
 		require.NotNil(t, f)
 		require.Equal(t, &wire.DatagramFrame{Data: []byte("foobar")}, f)
 	})
+}
+
+func TestDatagramQueueTryAdd(t *testing.T) {
+	cases := []struct {
+		name    string
+		queued  int
+		closed  bool
+		wantErr error
+	}{
+		{name: "space in the queue", queued: maxDatagramSendQueueLen - 1},
+		{name: "full queue", queued: maxDatagramSendQueueLen, wantErr: ErrDatagramQueueFull},
+		{name: "full queue, closed", queued: maxDatagramSendQueueLen, closed: true, wantErr: assert.AnError},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			queue := newDatagramQueue(func() {}, utils.DefaultLogger)
+			for i := 0; i < tc.queued; i++ {
+				require.NoError(t, queue.TryAdd(&wire.DatagramFrame{Data: []byte{0}}))
+			}
+			if tc.closed {
+				queue.CloseWithError(assert.AnError)
+			}
+			errChan := make(chan error, 1)
+			go func() { errChan <- queue.TryAdd(&wire.DatagramFrame{Data: []byte("foobar")}) }()
+			select {
+			case err := <-errChan:
+				if tc.wantErr != nil {
+					require.ErrorIs(t, err, tc.wantErr)
+					return
+				}
+				require.NoError(t, err)
+			case <-time.After(time.Second):
+				t.Fatal("TryAdd waited")
+			}
+			for i := 0; i < tc.queued; i++ {
+				queue.Pop()
+			}
+			require.Equal(t, &wire.DatagramFrame{Data: []byte("foobar")}, queue.Peek())
+		})
+	}
 }
 
 func TestDatagramQueueReceive(t *testing.T) {
