@@ -7,7 +7,7 @@ on:
 permissions: read-all
 jobs:
   PR:
-    runs-on: ${{ fromJSON(vars['CLUSTERFUZZ_LITE_RUNNER_UBUNTU'] || '"ubuntu-latest"') }}
+    runs-on: blacksmith-4vcpu-ubuntu-2204
     concurrency:
       group: ${{ github.workflow }}-${{ matrix.sanitizer }}-${{ github.ref }}
       cancel-in-progress: true

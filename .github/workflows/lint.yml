@@ -2,7 +2,7 @@ on: [push, pull_request]
 
 jobs:
   check:
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-4vcpu-ubuntu-2204
     timeout-minutes: 15
     env:
       GOEXPERIMENT: ${{ matrix.go == '1.24.x' && 'synctest' || '' }}
@@ -33,7 +33,7 @@ jobs:
         if: success() || failure() # run this step even if the previous one failed
         run: go tool gcassert ./...
   golangci-lint:
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-4vcpu-ubuntu-2204
     strategy:
       fail-fast: false
       matrix:
