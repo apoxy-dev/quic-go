@@ -133,7 +133,7 @@ func NewSentPacketHandler(
 ) SentPacketHandler {
 	var cc congestion.SendAlgorithmWithDebugInfos
 	if disableCongestionControl {
-		cc = congestion.NewNoopSender()
+		cc = congestion.NewNoopSender(connStats)
 	} else {
 		cc = congestion.NewCubicSender(
 			congestion.DefaultClock{},
@@ -1140,7 +1140,7 @@ func (h *sentPacketHandler) MigratedPath(now monotime.Time, initialMaxDatagramSi
 		h.appDataPackets.history.RemovePathProbe(pn)
 	}
 	if h.disableCongestionControl {
-		h.congestion = congestion.NewNoopSender()
+		h.congestion = congestion.NewNoopSender(h.connStats)
 	} else {
 		h.congestion = congestion.NewCubicSender(
 			congestion.DefaultClock{},

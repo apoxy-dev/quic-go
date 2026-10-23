@@ -635,16 +635,32 @@ func TestSentPacketHandlerDelayBasedLossDetection(t *testing.T) {
 }
 
 func TestSentPacketHandlerPacketBasedLossDetection(t *testing.T) {
+	// The loss counters of the ConnectionStats work with congestion control on and off.
+	for _, tc := range []struct {
+		name                     string
+		disableCongestionControl bool
+	}{
+		{name: "cubic"},
+		{name: "congestion control off", disableCongestionControl: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			testSentPacketHandlerPacketBasedLossDetection(t, tc.disableCongestionControl)
+		})
+	}
+}
+
+func testSentPacketHandlerPacketBasedLossDetection(t *testing.T, disableCongestionControl bool) {
 	rttStats := utils.NewRTTStats()
+	connStats := &utils.ConnectionStats{}
 	sph := NewSentPacketHandler(
 		0,
 		1200,
 		rttStats,
-		&utils.ConnectionStats{},
+		connStats,
 		true,
 		false,
 		nil,
-		false, // disable congestion control
+		disableCongestionControl,
 		protocol.PerspectiveServer,
 		nil,
 		utils.DefaultLogger,
@@ -676,6 +692,8 @@ func TestSentPacketHandlerPacketBasedLossDetection(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, []protocol.PacketNumber{pns[3], pns[4]}, packets.Acked)
 	require.Equal(t, []protocol.PacketNumber{pns[0], pns[1]}, packets.Lost)
+	require.Equal(t, uint64(2), connStats.PacketsLost.Load())
+	require.Equal(t, uint64(2000), connStats.BytesLost.Load())
 }
 
 func TestSentPacketHandlerPTO(t *testing.T) {

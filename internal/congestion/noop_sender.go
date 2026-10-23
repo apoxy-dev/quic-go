@@ -5,6 +5,7 @@ import (
 
 	"github.com/quic-go/quic-go/internal/monotime"
 	"github.com/quic-go/quic-go/internal/protocol"
+	"github.com/quic-go/quic-go/internal/utils"
 )
 
 // NoopSender is a no-op congestion controller that always allows sending.
@@ -12,12 +13,13 @@ import (
 // congestion control and QUIC CC is redundant.
 type NoopSender struct {
 	maxDatagramSize protocol.ByteCount
+	connStats       *utils.ConnectionStats
 }
 
 var _ SendAlgorithmWithDebugInfos = &NoopSender{}
 
-func NewNoopSender() *NoopSender {
-	return &NoopSender{maxDatagramSize: initialMaxDatagramSize}
+func NewNoopSender(connStats *utils.ConnectionStats) *NoopSender {
+	return &NoopSender{maxDatagramSize: initialMaxDatagramSize, connStats: connStats}
 }
 
 func (n *NoopSender) TimeUntilSend(protocol.ByteCount) monotime.Time { return 0 }
@@ -29,7 +31,11 @@ func (n *NoopSender) MaybeExitSlowStart()             {}
 func (n *NoopSender) OnPacketAcked(protocol.PacketNumber, protocol.ByteCount, protocol.ByteCount, monotime.Time) {
 }
 
-func (n *NoopSender) OnCongestionEvent(protocol.PacketNumber, protocol.ByteCount, protocol.ByteCount) {
+// OnCongestionEvent counts the loss as the Cubic sender does, so that the
+// ConnectionStats loss counters work with congestion control off.
+func (n *NoopSender) OnCongestionEvent(_ protocol.PacketNumber, lostBytes, _ protocol.ByteCount) {
+	n.connStats.PacketsLost.Add(1)
+	n.connStats.BytesLost.Add(uint64(lostBytes))
 }
 func (n *NoopSender) OnRetransmissionTimeout(bool)            {}
 func (n *NoopSender) SetMaxDatagramSize(s protocol.ByteCount) { n.maxDatagramSize = s }
