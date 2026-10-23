@@ -5,6 +5,7 @@ import (
 	"errors"
 	"io"
 	"net"
+	"slices"
 	"sync"
 	"testing"
 	"time"
@@ -73,6 +74,39 @@ func (c *inBandECNConn) lastWritten(n int) []uint8 {
 	return append([]uint8(nil), c.written[max(len(c.written)-n, 0):]...)
 }
 
+// inBandGSOConn is an inBandECNConn that also takes GSO batches. It sends each packet of a
+// batch as its own datagram, and records the number of packets of each batch.
+type inBandGSOConn struct {
+	*inBandECNConn
+
+	mu      sync.Mutex
+	batches []int
+}
+
+var _ quic.GSOPacketConn = &inBandGSOConn{}
+
+func (c *inBandGSOConn) WriteToGSO(b []byte, addr net.Addr, gsoSize uint16, ecn uint8) (int, error) {
+	c.mu.Lock()
+	c.batches = append(c.batches, (len(b)+int(gsoSize)-1)/int(gsoSize))
+	c.mu.Unlock()
+	var n int
+	for p := b; len(p) > 0; p = p[min(len(p), int(gsoSize)):] {
+		m, err := c.WriteToECN(p[:min(len(p), int(gsoSize))], addr, ecn)
+		n += m
+		if err != nil {
+			return n, err
+		}
+	}
+	return n, nil
+}
+
+// largestBatch returns the most packets of one batch.
+func (c *inBandGSOConn) largestBatch() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return slices.Max(append([]int{0}, c.batches...))
+}
+
 func (c *inBandECNConn) ReadFrom(b []byte) (int, net.Addr, error) {
 	n, addr, _, err := c.ReadFromECN(b)
 	return n, addr, err
@@ -93,6 +127,8 @@ func TestECNPacketConn(t *testing.T) {
 	cases := []struct {
 		name     string
 		dropRead bool
+		// gso makes each conn a GSOPacketConn.
+		gso bool
 		// wantLast is the ECN bits of the last packets that each side writes.
 		wantLast uint8
 	}{
@@ -100,15 +136,25 @@ func TestECNPacketConn(t *testing.T) {
 		{name: "bits read", wantLast: ect0},
 		// The peer reads Not-ECT, so ECN validation fails and the sender stops marking.
 		{name: "bits lost", dropRead: true, wantLast: notECT},
+		// ECN validation passes only if each packet of a batch has the ECN bits that the sender
+		// counted for it.
+		{name: "bits read, GSO", gso: true, wantLast: ect0},
+		{name: "bits lost, GSO", dropRead: true, gso: true, wantLast: notECT},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			var fromClient, fromServer events.Recorder
 			serverConn := &inBandECNConn{udp: newUDPConnLocalhost(t), dropRead: tc.dropRead}
 			clientConn := &inBandECNConn{udp: newUDPConnLocalhost(t), dropRead: tc.dropRead}
-			serverTr := &quic.Transport{Conn: serverConn}
+			var serverPC, clientPC net.PacketConn = serverConn, clientConn
+			var serverGSO, clientGSO *inBandGSOConn
+			if tc.gso {
+				serverGSO, clientGSO = &inBandGSOConn{inBandECNConn: serverConn}, &inBandGSOConn{inBandECNConn: clientConn}
+				serverPC, clientPC = serverGSO, clientGSO
+			}
+			serverTr := &quic.Transport{Conn: serverPC}
 			defer serverTr.Close()
-			clientTr := &quic.Transport{Conn: clientConn}
+			clientTr := &quic.Transport{Conn: clientPC}
 			defer clientTr.Close()
 
 			ln, err := serverTr.Listen(getTLSConfig(), getQuicConfig(&quic.Config{Tracer: newTracer(&fromClient)}))
@@ -159,6 +205,13 @@ func TestECNPacketConn(t *testing.T) {
 				for _, bits := range side.conn.lastWritten(5) {
 					require.Equal(t, tc.wantLast, bits, "ECN bits of a late packet of the %s", side.name)
 				}
+			}
+			// A conn with GSO gets batches of many packets. A conn without it gets single writes.
+			require.Equal(t, tc.gso, conn.ConnectionState().GSO)
+			require.Equal(t, tc.gso, sconn.ConnectionState().GSO)
+			if tc.gso {
+				require.Greater(t, clientGSO.largestBatch(), 1, "the client sent no batch of many packets")
+				require.Greater(t, serverGSO.largestBatch(), 1, "the server sent no batch of many packets")
 			}
 		})
 	}

@@ -66,10 +66,20 @@ type ECNPacketConn interface {
 	WriteToECN(b []byte, addr net.Addr, ecn uint8) (int, error)
 }
 
+// GSOPacketConn is an ECNPacketConn that also takes a batch of packets in one write.
+// If the PacketConn passed to the [Transport] satisfies this interface, quic-go sends with GSO through it.
+type GSOPacketConn interface {
+	ECNPacketConn
+	// WriteToGSO sends the packets of b, each gsoSize bytes except the last, to addr with the ECN bits ecn.
+	// It takes all packets, also the ones that it drops, or none and returns an error. It does not keep b.
+	WriteToGSO(b []byte, addr net.Addr, gsoSize uint16, ecn uint8) (int, error)
+}
+
 // wrapConn wraps pc. gro asks for UDP GRO on the socket.
 func wrapConn(pc net.PacketConn, gro bool) (rawConn, error) {
 	if c, ok := pc.(ECNPacketConn); ok {
-		return &ecnConn{ECNPacketConn: c}, nil
+		gc, _ := pc.(GSOPacketConn)
+		return &ecnConn{ECNPacketConn: c, gso: gc}, nil
 	}
 	if err := setReceiveBuffer(pc); err != nil {
 		if !strings.Contains(err.Error(), "use of closed network connection") {
@@ -164,6 +174,7 @@ func (c *basicConn) capabilities() connCapabilities { return connCapabilities{DF
 // The ECNPacketConn sets the DF bit of each packet.
 type ecnConn struct {
 	ECNPacketConn
+	gso GSOPacketConn // nil if the conn does not take GSO batches
 }
 
 var _ rawConn = &ecnConn{}
@@ -186,14 +197,19 @@ func (c *ecnConn) ReadPacket() (receivedPacket, error) {
 }
 
 func (c *ecnConn) WritePacket(b []byte, addr net.Addr, _ []byte, gsoSize uint16, ecn protocol.ECN) (int, error) {
-	if gsoSize != 0 {
-		panic("cannot use GSO with an ecnConn")
-	}
 	var bits uint8
 	if ecn != protocol.ECNUnsupported {
 		bits = ecn.ToHeaderBits()
 	}
+	if gsoSize != 0 {
+		if c.gso == nil {
+			panic("cannot use GSO with an ecnConn that is not a GSOPacketConn")
+		}
+		return c.gso.WriteToGSO(b, addr, gsoSize, bits)
+	}
 	return c.WriteToECN(b, addr, bits)
 }
 
-func (c *ecnConn) capabilities() connCapabilities { return connCapabilities{DF: true, ECN: true} }
+func (c *ecnConn) capabilities() connCapabilities {
+	return connCapabilities{DF: true, ECN: true, GSO: c.gso != nil}
+}

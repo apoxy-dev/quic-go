@@ -68,7 +68,8 @@ type Transport struct {
 	// 4. It uses Generic Segmentation Offload (GSO) to efficiently send batches of packets (on Linux).
 	//
 	// A connection that implements the ECNPacketConn interface reads and writes the ECN bits itself.
-	// quic-go then uses ECN and DPLPMTUD with it.
+	// quic-go then uses ECN and DPLPMTUD with it. If it also implements GSOPacketConn,
+	// quic-go sends batches of packets with one WriteToGSO call.
 	//
 	// After passing the connection to the Transport, it's invalid to call ReadFrom or WriteTo on the connection.
 	Conn net.PacketConn
