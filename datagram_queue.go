@@ -40,7 +40,7 @@ func getDatagramBuffer(n int) []byte {
 	}
 }
 
-// ReleaseDatagram gives a datagram from ReceiveDatagram back for reuse.
+// ReleaseDatagram gives a datagram from ReceiveDatagram or ReceiveDatagrams back for reuse.
 // The caller must not use b or slices of b after the call.
 // A datagram that is not released is garbage collected.
 func ReleaseDatagram(b []byte) {
@@ -74,7 +74,13 @@ type datagramQueue struct {
 
 	rcvMx    sync.Mutex
 	rcvQueue ringbuffer.RingBuffer[[]byte]
-	rcvd     chan struct{} // Receive waits on it when the receive queue is empty.
+	rcvd     chan struct{} // receive waits on it when no datagram is ready.
+	// ready is the number of datagrams at the front of rcvQueue that receive can take: the
+	// datagrams of the passes of the run loop that ended.
+	ready int
+	// pending is set when HandleDatagramFrame queued a datagram after the last wake. Only the
+	// run loop uses it.
+	pending  bool
 	rcvDrops atomic.Uint64
 
 	closeErr error
@@ -157,9 +163,8 @@ func (h *datagramQueue) Pop() {
 	}
 }
 
-// HandleDatagramFrame queues a copy of the frame data for Receive.
-// The frame data can be part of the packet buffer.
-// When the receive queue is full, it drops the datagram.
+// HandleDatagramFrame queues a copy of the frame data, or drops and counts it when the queue is full.
+// It does not wake a receiver: the run loop calls wake after the packets of one wakeup.
 func (h *datagramQueue) HandleDatagramFrame(f *wire.DatagramFrame) {
 	data := getDatagramBuffer(len(f.Data))
 	copy(data, f.Data)
@@ -175,29 +180,56 @@ func (h *datagramQueue) HandleDatagramFrame(f *wire.DatagramFrame) {
 	}
 	h.rcvQueue.PushBack(data)
 	h.rcvMx.Unlock()
+	h.pending = true
+}
+
+// wake makes the datagrams queued after the last wake ready, and wakes a receiver. Only the run
+// loop calls it, after the packets of one wakeup.
+func (h *datagramQueue) wake() {
+	if !h.pending {
+		return
+	}
+	h.pending = false
+	h.rcvMx.Lock()
+	h.ready = h.rcvQueue.Len()
+	h.rcvMx.Unlock()
 	select {
 	case h.rcvd <- struct{}{}:
 	default:
 	}
 }
 
-// Receive returns the next received datagram.
-func (h *datagramQueue) Receive(ctx context.Context) ([]byte, error) {
+// receive waits for ready datagrams and puts up to len(bufs) of them in bufs, oldest first. After
+// the close, all queued datagrams are ready, then the close error comes. No buffers return 0.
+func (h *datagramQueue) receive(ctx context.Context, bufs [][]byte) (int, error) {
+	if len(bufs) == 0 {
+		return 0, nil
+	}
+	closed := false
 	for {
 		h.rcvMx.Lock()
-		if !h.rcvQueue.Empty() {
-			data := h.rcvQueue.PopFront()
-			h.rcvMx.Unlock()
-			return data, nil
+		if closed {
+			// The run loop stopped, so no pass is open.
+			h.ready = h.rcvQueue.Len()
 		}
+		n := min(len(bufs), h.ready)
+		for i := range n {
+			bufs[i] = h.rcvQueue.PopFront()
+		}
+		h.ready -= n
 		h.rcvMx.Unlock()
+		if n > 0 {
+			return n, nil
+		}
+		if closed {
+			return 0, h.closeErr
+		}
 		select {
 		case <-h.rcvd:
-			continue
 		case <-h.closed:
-			return nil, h.closeErr
+			closed = true
 		case <-ctx.Done():
-			return nil, ctx.Err()
+			return 0, ctx.Err()
 		}
 	}
 }

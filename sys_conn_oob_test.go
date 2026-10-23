@@ -330,8 +330,12 @@ func TestReadsMultipleMessagesInOneBatch(t *testing.T) {
 	require.Equal(t, 2, bc.callCounter)
 }
 
-// batchReader returns reads of sizes[i] non-QUIC packets, then net.ErrClosed.
-type batchReader struct{ sizes []int }
+// batchReader returns reads of sizes[i] non-QUIC packets, then net.ErrClosed. With fail, the
+// last message of the last read has control data that does not parse, so that read fails there.
+type batchReader struct {
+	sizes []int
+	fail  bool
+}
 
 func (c *batchReader) ReadBatch(ms []ipv4.Message, _ int) (int, error) {
 	if len(c.sizes) == 0 {
@@ -342,8 +346,24 @@ func (c *batchReader) ReadBatch(ms []ipv4.Message, _ int) (int, error) {
 	for i := range n {
 		ms[i].Buffers[0][0] = 1 // The QUIC bit is not set.
 		ms[i].N = 1
+		ms[i].NN = 0
+	}
+	if c.fail && len(c.sizes) == 0 {
+		// A control message header is longer than 4 bytes.
+		clear(ms[n-1].OOB[:4])
+		ms[n-1].NN = 4
 	}
 	return n, nil
+}
+
+// reads returns the handler calls of reads of sizes[i] packets: p for each packet, and e for
+// each batch end.
+func reads(sizes ...int) string {
+	var b strings.Builder
+	for _, n := range sizes {
+		b.WriteString(strings.Repeat("p", n) + "e")
+	}
+	return b.String()
 }
 
 // singleReader returns n non-QUIC packets, then net.ErrClosed.
@@ -364,44 +384,60 @@ func (c *singleReader) ReadFrom(b []byte) (int, net.Addr, error) {
 func TestTransportNonQUICBatchEnd(t *testing.T) {
 	cases := []struct {
 		name string
-		// conn returns the conn and the packets of each of its reads.
-		conn func(t *testing.T) (net.PacketConn, []int)
+		// conn returns the conn and the handler calls that its reads give.
+		conn func(t *testing.T) (net.PacketConn, string)
 	}{
 		{
 			name: "batched reads",
-			conn: func(t *testing.T) (net.PacketConn, []int) {
+			conn: func(t *testing.T) (net.PacketConn, string) {
 				c, err := newConn(newUDPConnLocalhost(t), true, false)
 				require.NoError(t, err)
 				sizes := []int{c.batch, 1, c.batch/2 + 1}
 				c.batchConn = &batchReader{sizes: sizes}
-				return c, sizes
+				return c, reads(sizes...)
 			},
 		},
 		{
 			name: "single reads",
-			conn: func(t *testing.T) (net.PacketConn, []int) {
+			conn: func(t *testing.T) (net.PacketConn, string) {
 				t.Setenv("QUIC_GO_DISABLE_RECEIVE_BUFFER_WARNING", "true")
-				return &singleReader{PacketConn: newUDPConnLocalhost(t), n: 3}, []int{1, 1, 1}
+				return &singleReader{PacketConn: newUDPConnLocalhost(t), n: 3}, reads(1, 1, 1)
+			},
+		},
+		{
+			// The packets of the read that fails get their batch end before the read loop stops.
+			name: "read fails after packets of the read",
+			conn: func(t *testing.T) (net.PacketConn, string) {
+				c, err := newConn(newUDPConnLocalhost(t), true, false)
+				require.NoError(t, err)
+				c.batchConn = &batchReader{sizes: []int{2, 3}, fail: true}
+				return c, reads(2, 2)
+			},
+		},
+		{
+			name: "read fails with no packets of the read",
+			conn: func(t *testing.T) (net.PacketConn, string) {
+				c, err := newConn(newUDPConnLocalhost(t), true, false)
+				require.NoError(t, err)
+				c.batchConn = &batchReader{sizes: []int{2, 1}, fail: true}
+				return c, reads(2)
 			},
 		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			conn, sizes := tc.conn(t)
+			conn, want := tc.conn(t)
 			// p is one packet, and e is one batch end.
-			var want, got strings.Builder
-			for _, n := range sizes {
-				want.WriteString(strings.Repeat("p", n) + "e")
-			}
+			var got strings.Builder
 			tr := &Transport{
 				Conn:                 conn,
 				NonQUICPacketHandler: func([]byte, net.Addr) { got.WriteByte('p') },
 				NonQUICBatchEnd:      func() { got.WriteByte('e') },
 			}
 			require.NoError(t, tr.Start())
-			<-tr.listening // The read loop stops at net.ErrClosed.
+			<-tr.listening // The read loop stops at the error of a read.
 			require.NoError(t, tr.Close())
-			require.Equal(t, want.String(), got.String())
+			require.Equal(t, want, got.String())
 		})
 	}
 }

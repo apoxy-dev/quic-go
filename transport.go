@@ -143,8 +143,8 @@ type Transport struct {
 	// It runs on the read loop and must not block; b is valid only until it returns.
 	NonQUICPacketHandler func(b []byte, addr net.Addr)
 
-	// NonQUICBatchEnd, if set, runs on the read loop after it handles all packets of one read from Conn.
-	// NonQUICPacketHandler can keep copies of the packets of a read and write them here.
+	// NonQUICBatchEnd, if set, runs on the read loop after all packets of one read from Conn, also before the
+	// read loop stops after a failed read. NonQUICPacketHandler can keep copies of the packets and write them here.
 	NonQUICBatchEnd func()
 
 	// EnableGRO turns on UDP GRO on Conn, on Linux 5.12 and later. The kernel then joins the
@@ -557,6 +557,13 @@ var setBufferWarningOnce sync.Once
 func (t *Transport) listen(conn rawConn) {
 	// A conn that reads in batches tells if packets of the last read are left.
 	bc, _ := conn.(interface{ buffered() bool })
+	// open is set while handled packets of a read wait for NonQUICBatchEnd.
+	open := false
+	defer func() {
+		if open {
+			t.NonQUICBatchEnd()
+		}
+	}()
 	for {
 		p, err := conn.ReadPacket()
 		//nolint:staticcheck // SA1019 ignore this!
@@ -582,7 +589,10 @@ func (t *Transport) listen(conn rawConn) {
 			return
 		}
 		t.handlePacket(p)
-		if t.NonQUICBatchEnd != nil && (bc == nil || !bc.buffered()) {
+		if t.NonQUICBatchEnd == nil {
+			continue
+		}
+		if open = bc != nil && bc.buffered(); !open {
 			t.NonQUICBatchEnd()
 		}
 	}

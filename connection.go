@@ -1013,6 +1013,8 @@ func (c *Conn) handlePackets() (wasProcessed bool, _ error) {
 
 	if c.receivedPackets.Empty() {
 		c.receivedPacketMx.Unlock()
+		// The undecryptable packets that the run loop handled before can hold datagrams.
+		c.datagramQueue.wake()
 		return false, nil
 	}
 	// After the handshake, drop the packets that waited too long in a queue that one wakeup does not drain.
@@ -1060,6 +1062,8 @@ func (c *Conn) handlePackets() (wasProcessed bool, _ error) {
 		default:
 		}
 	}
+	// The datagrams of this pass go to the receiver in one batch.
+	c.datagramQueue.wake()
 	return wasProcessed, nil
 }
 
@@ -3114,13 +3118,22 @@ func (c *Conn) sendDatagram(p []byte, add func(*wire.DatagramFrame) error) error
 	return nil
 }
 
-// ReceiveDatagram gets a message received in a QUIC datagram, as specified in RFC 9221.
-// The caller can give the message back with ReleaseDatagram when it does not use it any more.
-func (c *Conn) ReceiveDatagram(ctx context.Context) ([]byte, error) {
+// ReceiveDatagrams puts up to len(bufs) datagrams (RFC 9221) of finished run loop passes in bufs, in order.
+// Give each back with ReleaseDatagram. An error comes with none; after a close, queued ones come first.
+func (c *Conn) ReceiveDatagrams(ctx context.Context, bufs [][]byte) (int, error) {
 	if !c.config.EnableDatagrams {
-		return nil, errors.New("datagram support disabled")
+		return 0, errors.New("datagram support disabled")
 	}
-	return c.datagramQueue.Receive(ctx)
+	return c.datagramQueue.receive(ctx, bufs)
+}
+
+// ReceiveDatagram gets one message received in a QUIC datagram. It is ReceiveDatagrams with one buffer.
+func (c *Conn) ReceiveDatagram(ctx context.Context) ([]byte, error) {
+	var bufs [1][]byte
+	if _, err := c.ReceiveDatagrams(ctx, bufs[:]); err != nil {
+		return nil, err
+	}
+	return bufs[0], nil
 }
 
 // LocalAddr returns the local address of the QUIC connection.

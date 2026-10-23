@@ -10,6 +10,7 @@ import (
 	"net"
 	"net/netip"
 	"strconv"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -3610,35 +3611,245 @@ func testConnectionMigration(t *testing.T, enabled bool) {
 }
 
 func TestConnectionDatagrams(t *testing.T) {
-	t.Run("disabled", func(t *testing.T) {
-		testConnectionDatagrams(t, false)
-	})
-	t.Run("enabled", func(t *testing.T) {
-		testConnectionDatagrams(t, true)
+	cases := []struct {
+		name    string
+		enabled bool
+		bufs    int
+		wantErr bool
+	}{
+		{name: "disabled, no buffers", bufs: 0, wantErr: true},
+		{name: "disabled, 2 buffers", bufs: 2, wantErr: true},
+		{name: "enabled, no buffers", enabled: true, bufs: 0},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			conn := newServerTestConnection(t, nil, &Config{EnableDatagrams: tc.enabled}, false).conn
+			n, err := conn.ReceiveDatagrams(context.Background(), make([][]byte, tc.bufs))
+			require.Zero(t, n)
+			if tc.wantErr {
+				require.EqualError(t, err, "datagram support disabled")
+				_, err = conn.ReceiveDatagram(context.Background())
+				require.EqualError(t, err, "datagram support disabled")
+			} else {
+				require.NoError(t, err)
+			}
+		})
+	}
+	t.Run("disabled, DATAGRAM frame", testConnectionDatagramsDisabled)
+	t.Run("one pass", testConnectionDatagramsPass)
+	t.Run("undecryptable packet", testConnectionDatagramsUndecryptable)
+	t.Run("pass that fails", testConnectionDatagramsPassFails)
+}
+
+// datagramFrames returns the DATAGRAM frames of the payloads, as the payload of one packet.
+func datagramFrames(t *testing.T, payloads ...string) []byte {
+	t.Helper()
+	var data []byte
+	for _, p := range payloads {
+		var err error
+		data, err = (&wire.DatagramFrame{Data: []byte(p), DataLenPresent: true}).Append(data, protocol.Version1)
+		require.NoError(t, err)
+	}
+	return data
+}
+
+func testConnectionDatagramsDisabled(t *testing.T) {
+	tc := newServerTestConnection(t, nil, &Config{EnableDatagrams: false}, false)
+	_, _, _, err := tc.conn.handleFrames(datagramFrames(t, "foo"), protocol.ConnectionID{}, protocol.Encryption1RTT, nil, monotime.Now())
+	require.ErrorIs(t, err, &qerr.TransportError{ErrorCode: qerr.FrameEncodingError, FrameType: uint64(wire.FrameTypeDatagramWithLength)})
+}
+
+// The datagrams of one pass of handlePackets come back in one call, in order.
+func testConnectionDatagramsPass(t *testing.T) {
+	mockCtrl := gomock.NewController(t)
+	unpacker := NewMockUnpacker(mockCtrl)
+	tc := newServerTestConnection(t, mockCtrl, &Config{EnableDatagrams: true}, false,
+		connectionOptUnpacker(unpacker),
+		connectionOptHandshakeConfirmed(),
+	)
+	// The unpacker gives each packet its own frames, so the test sees the order of the packets.
+	var pn protocol.PacketNumber
+	pass := func(packets ...[]byte) {
+		for _, data := range packets {
+			pn++
+			p := getShortHeaderPacket(t, tc.remoteAddr, tc.srcConnID, pn, []byte("encrypted"))
+			unpacker.EXPECT().UnpackShortHeader(gomock.Any(), p.data).Return(pn, protocol.PacketNumberLen2, protocol.KeyPhaseZero, data, nil)
+			tc.conn.handlePacket(p)
+		}
+		_, err := tc.conn.handlePackets()
+		require.NoError(t, err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	pass(datagramFrames(t, "foo", "bar"), datagramFrames(t, "baz"))
+	bufs := make([][]byte, 4)
+	n, err := tc.conn.ReceiveDatagrams(ctx, bufs)
+	require.NoError(t, err)
+	require.Equal(t, [][]byte{[]byte("foo"), []byte("bar"), []byte("baz"), nil}, bufs)
+	require.Equal(t, 3, n)
+	for _, b := range bufs[:n] {
+		require.Equal(t, smallDatagramSize, cap(b), "not a buffer of the pool")
+		ReleaseDatagram(b)
+	}
+
+	pass(datagramFrames(t, "qux", "quux"))
+	for _, want := range []string{"qux", "quux"} {
+		b, err := tc.conn.ReceiveDatagram(ctx)
+		require.NoError(t, err)
+		require.Equal(t, []byte(want), b)
+	}
+}
+
+// A 0-RTT packet waits in the undecryptable queue until the handshake keys arrive. The run loop
+// then handles it outside of a pass, and the next pass wakes the receiver, also with no packets.
+func testConnectionDatagramsUndecryptable(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		mockCtrl := gomock.NewController(t)
+		unpacker := NewMockUnpacker(mockCtrl)
+		cs := mocks.NewMockCryptoSetup(mockCtrl)
+		tc := newServerTestConnection(t, mockCtrl, &Config{EnableDatagrams: true}, false,
+			connectionOptUnpacker(unpacker),
+			connectionOptCryptoSetup(cs),
+		)
+		// The length of a long header is the packet number and the payload.
+		header := func(typ protocol.PacketType, payload string) wire.ExtendedHeader {
+			return wire.ExtendedHeader{
+				Header: wire.Header{
+					Type:             typ,
+					DestConnectionID: tc.srcConnID,
+					SrcConnectionID:  tc.destConnID,
+					Length:           protocol.ByteCount(protocol.PacketNumberLen1) + protocol.ByteCount(len(payload)),
+					Version:          protocol.Version1,
+				},
+				PacketNumberLen: protocol.PacketNumberLen1,
+				PacketNumber:    1,
+			}
+		}
+		hdr0RTT, hdrHandshake := header(protocol.PacketType0RTT, "0-RTT"), header(protocol.PacketTypeHandshake, "handshake")
+		cf, err := (&wire.CryptoFrame{Data: []byte("foobar")}).Append(nil, protocol.Version1)
+		require.NoError(t, err)
+
+		cs.EXPECT().StartHandshake(gomock.Any())
+		cs.EXPECT().NextEvent().Return(handshake.Event{Kind: handshake.EventNoEvent})
+		cs.EXPECT().DiscardInitialKeys().AnyTimes()
+		tc.packer.EXPECT().PackCoalescedPacket(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(nil, nil).AnyTimes()
+		// The 0-RTT packet has no keys at first. The Handshake packet makes them available.
+		var zeroRTT atomic.Int32
+		unpacker.EXPECT().UnpackLongHeader(gomock.Any(), gomock.Any()).DoAndReturn(
+			func(hdr *wire.Header, _ []byte) (*unpackedPacket, error) {
+				switch hdr.Type {
+				case protocol.PacketTypeHandshake:
+					return &unpackedPacket{hdr: &hdrHandshake, encryptionLevel: protocol.EncryptionHandshake, data: cf}, nil
+				case protocol.PacketType0RTT:
+					if zeroRTT.Add(1) == 1 {
+						return nil, handshake.ErrKeysNotYetAvailable
+					}
+					return &unpackedPacket{hdr: &hdr0RTT, encryptionLevel: protocol.Encryption0RTT, data: datagramFrames(t, "foo")}, nil
+				}
+				return nil, fmt.Errorf("unexpected packet type %s", hdr.Type)
+			},
+		).Times(3)
+		gomock.InOrder(
+			cs.EXPECT().HandleMessage(gomock.Any(), gomock.Any()),
+			cs.EXPECT().NextEvent().Return(handshake.Event{Kind: handshake.EventReceivedReadKeys}),
+			cs.EXPECT().NextEvent().Return(handshake.Event{Kind: handshake.EventNoEvent}),
+		)
+
+		errChan := make(chan error, 1)
+		go func() { errChan <- tc.conn.run() }()
+		type result struct {
+			n   int
+			err error
+		}
+		bufs := make([][]byte, 4)
+		res := make(chan result, 1)
+		go func() {
+			n, err := tc.conn.ReceiveDatagrams(context.Background(), bufs)
+			res <- result{n, err}
+		}()
+
+		tc.conn.handlePacket(getLongHeaderPacket(t, tc.remoteAddr, &hdr0RTT, []byte("0-RTT")))
+		synctest.Wait()
+		require.Empty(t, res)
+		require.Equal(t, int32(1), zeroRTT.Load(), "the 0-RTT packet waits for its keys")
+		tc.conn.handlePacket(getLongHeaderPacket(t, tc.remoteAddr, &hdrHandshake, []byte("handshake")))
+		synctest.Wait()
+		require.Equal(t, int32(2), zeroRTT.Load(), "the run loop handled the 0-RTT packet again")
+		select {
+		case r := <-res:
+			require.NoError(t, r.err)
+			require.Equal(t, 1, r.n)
+			require.Equal(t, []byte("foo"), bufs[0])
+		default:
+			t.Fatal("the receiver did not get the datagram of the 0-RTT packet")
+		}
+
+		// test teardown
+		tc.connRunner.EXPECT().Remove(gomock.Any()).AnyTimes()
+		cs.EXPECT().Close()
+		tc.conn.destroy(nil)
+		synctest.Wait()
+		select {
+		case err := <-errChan:
+			require.NoError(t, err)
+		default:
+			t.Fatal("the run loop did not return")
+		}
 	})
 }
 
-func testConnectionDatagrams(t *testing.T, enabled bool) {
-	tc := newServerTestConnection(t, nil, &Config{EnableDatagrams: enabled}, false)
+// When a packet of a pass fails, the pass has no wake. The receiver gets the datagrams of
+// the pass after the connection closes, then the close error.
+func testConnectionDatagramsPassFails(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		mockCtrl := gomock.NewController(t)
+		unpacker := NewMockUnpacker(mockCtrl)
+		tc := newServerTestConnection(t, mockCtrl, &Config{EnableDatagrams: true}, false,
+			connectionOptUnpacker(unpacker),
+		)
+		ok := getShortHeaderPacket(t, tc.remoteAddr, tc.srcConnID, 1, []byte("foo"))
+		fails := getShortHeaderPacket(t, tc.remoteAddr, tc.srcConnID, 2, []byte("fails"))
+		unpacker.EXPECT().UnpackShortHeader(gomock.Any(), ok.data).Return(
+			protocol.PacketNumber(1), protocol.PacketNumberLen2, protocol.KeyPhaseZero, datagramFrames(t, "foo"), nil,
+		)
+		unpacker.EXPECT().UnpackShortHeader(gomock.Any(), fails.data).Return(
+			protocol.PacketNumber(0), protocol.PacketNumberLen(0), protocol.KeyPhaseBit(0), nil, wire.ErrInvalidReservedBits,
+		)
+		tc.connRunner.EXPECT().ReplaceWithClosed(gomock.Any(), gomock.Any(), gomock.Any())
+		tc.packer.EXPECT().PackConnectionClose(gomock.Any(), gomock.Any(), protocol.Version1).Return(&coalescedPacket{buffer: getPacketBuffer()}, nil)
+		tc.sendConn.EXPECT().Write(gomock.Any(), gomock.Any(), gomock.Any())
 
-	data, err := (&wire.DatagramFrame{Data: []byte("foo"), DataLenPresent: true}).Append(nil, protocol.Version1)
-	require.NoError(t, err)
-	data, err = (&wire.DatagramFrame{Data: []byte("bar")}).Append(data, protocol.Version1)
-	require.NoError(t, err)
-	_, _, _, err = tc.conn.handleFrames(data, protocol.ConnectionID{}, protocol.Encryption1RTT, nil, monotime.Now())
+		type result struct {
+			n   int
+			err error
+		}
+		bufs := make([][]byte, 4)
+		res := make(chan result, 2)
+		go func() {
+			for {
+				n, err := tc.conn.ReceiveDatagrams(context.Background(), bufs)
+				res <- result{n, err}
+				if err != nil {
+					return
+				}
+			}
+		}()
+		synctest.Wait()
+		// Both packets are in the queue when the run loop starts, so they are one pass.
+		tc.conn.handlePacket(ok)
+		tc.conn.handlePacket(fails)
+		errChan := make(chan error, 1)
+		go func() { errChan <- tc.conn.run() }()
+		synctest.Wait()
 
-	if !enabled {
-		require.ErrorIs(t, err, &qerr.TransportError{ErrorCode: qerr.FrameEncodingError, FrameType: uint64(wire.FrameTypeDatagramWithLength)})
-		return
-	}
-
-	require.NoError(t, err)
-	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
-	defer cancel()
-	d, err := tc.conn.ReceiveDatagram(ctx)
-	require.NoError(t, err)
-	require.Equal(t, []byte("foo"), d)
-	d, err = tc.conn.ReceiveDatagram(ctx)
-	require.NoError(t, err)
-	require.Equal(t, []byte("bar"), d)
+		require.ErrorIs(t, <-errChan, &qerr.TransportError{ErrorCode: qerr.ProtocolViolation})
+		r := <-res
+		require.NoError(t, r.err)
+		require.Equal(t, 1, r.n)
+		require.Equal(t, []byte("foo"), bufs[0])
+		r = <-res
+		require.Zero(t, r.n)
+		require.ErrorIs(t, r.err, &qerr.TransportError{ErrorCode: qerr.ProtocolViolation})
+	})
 }

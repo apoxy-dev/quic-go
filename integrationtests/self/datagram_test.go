@@ -364,6 +364,73 @@ func TestDatagramPayloadsWithBufferReuse(t *testing.T) {
 	require.Greater(t, received, num/2)
 }
 
+// The server reads the datagrams in batches. Each datagram that arrives must have the payload that
+// was sent and arrive only once. A call returns datagrams exactly when it returns no error.
+func TestDatagramBatchReceive(t *testing.T) {
+	server, err := quic.Listen(
+		newUDPConnLocalhost(t),
+		getTLSConfig(),
+		getQuicConfig(&quic.Config{EnableDatagrams: true}),
+	)
+	require.NoError(t, err)
+	defer server.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), scaleDuration(2*time.Second))
+	defer cancel()
+	clientConn, err := quic.Dial(
+		ctx,
+		newUDPConnLocalhost(t),
+		server.Addr(),
+		getTLSClientConfig(),
+		getQuicConfig(&quic.Config{EnableDatagrams: true}),
+	)
+	require.NoError(t, err)
+	defer clientConn.CloseWithError(0, "")
+	serverConn, err := server.Accept(ctx)
+	require.NoError(t, err)
+	defer serverConn.CloseWithError(0, "")
+
+	const num = 200
+	payload := func(i int) []byte {
+		b := make([]byte, 500)
+		binary.BigEndian.PutUint16(b, uint16(i))
+		for j := 2; j < len(b); j++ {
+			b[j] = byte(i)
+		}
+		return b
+	}
+	for i := range num {
+		require.NoError(t, clientConn.SendDatagram(payload(i)))
+	}
+	// Read until the deadline, so that a datagram that comes back after all others is seen too.
+	readCtx, readCancel := context.WithTimeout(context.Background(), scaleDuration(time.Second))
+	defer readCancel()
+	var received int
+	seen := make([]bool, num)
+	bufs := make([][]byte, 64)
+	for {
+		n, err := serverConn.ReceiveDatagrams(readCtx, bufs)
+		if err != nil {
+			require.ErrorIs(t, err, context.DeadlineExceeded)
+			require.Zero(t, n)
+			break
+		}
+		require.Positive(t, n)
+		for _, got := range bufs[:n] {
+			require.GreaterOrEqual(t, len(got), 2)
+			i := int(binary.BigEndian.Uint16(got))
+			require.Less(t, i, num)
+			require.False(t, seen[i], "datagram %d arrived again", i)
+			seen[i] = true
+			require.Equal(t, payload(i), got)
+			quic.ReleaseDatagram(got)
+			received++
+		}
+	}
+	t.Logf("received %d of %d datagrams", received, num)
+	require.Positive(t, received)
+}
+
 // Datagrams of changing sizes go out in GSO batches. The sender must not drop any of them.
 func TestDatagramGSOMixedSizes(t *testing.T) {
 	server, err := quic.Listen(
