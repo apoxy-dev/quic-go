@@ -356,6 +356,16 @@ func (c *batchReader) ReadBatch(ms []ipv4.Message, _ int) (int, error) {
 	return n, nil
 }
 
+// newBatchConn returns an oobConn, and skips the test when a read has fewer than n packets.
+func newBatchConn(t *testing.T, n int) *oobConn {
+	c, err := newConn(newUDPConnLocalhost(t), true, false)
+	require.NoError(t, err)
+	if c.batch < n {
+		t.Skipf("a read has at most %d packets", c.batch)
+	}
+	return c
+}
+
 // reads returns the handler calls of reads of sizes[i] packets: p for each packet, and e for
 // each batch end.
 func reads(sizes ...int) string {
@@ -408,8 +418,7 @@ func TestTransportNonQUICBatchEnd(t *testing.T) {
 			// The packets of the read that fails get their batch end before the read loop stops.
 			name: "read fails after packets of the read",
 			conn: func(t *testing.T) (net.PacketConn, string) {
-				c, err := newConn(newUDPConnLocalhost(t), true, false)
-				require.NoError(t, err)
+				c := newBatchConn(t, 3)
 				c.batchConn = &batchReader{sizes: []int{2, 3}, fail: true}
 				return c, reads(2, 2)
 			},
@@ -417,8 +426,7 @@ func TestTransportNonQUICBatchEnd(t *testing.T) {
 		{
 			name: "read fails with no packets of the read",
 			conn: func(t *testing.T) (net.PacketConn, string) {
-				c, err := newConn(newUDPConnLocalhost(t), true, false)
-				require.NoError(t, err)
+				c := newBatchConn(t, 2)
 				c.batchConn = &batchReader{sizes: []int{2, 1}, fail: true}
 				return c, reads(2)
 			},
